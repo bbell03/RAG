@@ -1,0 +1,109 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "DoughResearchInsightCard",
+  "description": "Atomic unit of dough-texture research knowledge, sized for retrieval rather than long-form notes. Enum lists on variables / style_scope / phase / relevance_targets are preferred vocabulary; unknown slug labels are allowed so a new claim is not rewritten to hydration or general.",
+  "type": "object",
+  "required": ["id", "claim", "variables", "style_scope", "confidence"],
+  "properties": {
+    "id": {
+      "type": "string",
+      "description": "Stable slug, e.g. 'windowpane-test-gluten-check'."
+    },
+    "claim": {
+      "type": "string",
+      "description": "One sentence, falsifiable if possible. This is the primary text that gets embedded."
+    },
+    "variables": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "type": "string", "minLength": 1, "pattern": "^[a-z][a-z0-9_]*$" },
+      "x-preferred": [
+        "hydration",
+        "humidity",
+        "leavening",
+        "kneading",
+        "tactility",
+        "extensibility",
+        "gluten",
+        "fermentation_time",
+        "cold_ferment",
+        "temperature",
+        "salt",
+        "flour_protein",
+        "bake_temp",
+        "bake_time"
+      ],
+      "description": "What the claim is about. Process knobs (hydration, salt) and environment (humidity, temperature) can both appear. Preferred list is in x-preferred; other slugs are kept."
+    },
+    "style_scope": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "type": "string", "minLength": 1, "pattern": "^[a-z][a-z0-9_]*$" },
+      "x-preferred": ["ny_slice", "neapolitan", "sicilian", "al_taglio", "sourdough", "general"],
+      "description": "Which pizza style(s) this applies to. 'general' = style-agnostic. Unknown styles are kept, not rewritten to general."
+    },
+    "phase": {
+      "description": "When you would check or apply this. Array preferred; a single string is still valid on older cards.",
+      "oneOf": [
+        { "type": "string" },
+        { "type": "array", "items": { "type": "string", "minLength": 1 } }
+      ],
+      "x-preferred": ["mixing", "kneading", "bulk_fermentation", "shaping", "proofing", "baking", "diagnostic"]
+    },
+    "kind": {
+      "type": "string",
+      "enum": ["mechanism", "checkpoint", "tradeoff", "warning"],
+      "description": "What kind of fact this is. Optional. mechanism = how dough works; checkpoint = a test or cue; tradeoff = one variable substitutes for another; warning = do not treat X as Y."
+    },
+    "status": {
+      "type": "string",
+      "enum": ["draft", "reviewed", "published"],
+      "description": "Library life-cycle. Drafts from recommend/ingest stay draft until you raise them. Optional on older cards."
+    },
+    "source": {
+      "type": "object",
+      "properties": {
+        "type": { "type": "string", "enum": ["conversation", "article", "book", "experiment", "video", "web"] },
+        "reference": { "type": "string", "description": "URL, title, or citation." }
+      }
+    },
+    "confidence": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1,
+      "description": "Subjective confidence in this claim, for weighting retrieval/surfacing. Composer drafts are capped at 0.45."
+    },
+    "contradicts": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Card ids this claim conflicts with."
+    },
+    "refines": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Card ids this claim sharpens or adds nuance to."
+    },
+    "relevance_targets": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1, "pattern": "^[a-z][a-z0-9_]*$" },
+      "x-preferred": ["fermentation_lab_dashboard", "pizza_cart_app", "mise_en_place", "general_reference"],
+      "description": "Optional product routing, not dough knowledge. Default general_reference if omitted. Unknown surfaces are kept."
+    },
+    "corroboration": {
+      "type": "object",
+      "description": "Truth check after library coverage. Voyage does not produce this.",
+      "properties": {
+        "verdict": {"type": "string", "enum": ["support", "conflict", "insufficient", "skipped"]},
+        "score": {"type": "number", "minimum": 0, "maximum": 1},
+        "rationale": {"type": "string"},
+        "citations": {"type": "array", "items": {"type": "object"}},
+        "contradicts": {"type": "array", "items": {"type": "string"}},
+        "checked_at": {"type": "string", "format": "date"}
+      }
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date"
+    }
+  }
+}
