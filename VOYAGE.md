@@ -2,9 +2,9 @@
 
 This is what Voyage actually does for the dough-research card library — and what it does not do.
 
-Voyage is an **embedding API**. You send it text; it returns a list of numbers (a vector). This repo uses those vectors to find cards in `cards.db` that are *about the same thing* as a question. Voyage does not read `schema.json`, does not write `cards.jsonl`, does not judge whether a claim is true, and does not produce a recommendation. Truth evaluation is a separate Claude critic (`corroboration` on the card) that fetches cited URLs and a short web search. `--no-truth` keeps library-only coverage.
+Voyage is an **embedding API**. You send it text; it returns a list of numbers (a vector). This repo uses those vectors to find cards in `cards.db` that are *about the same thing* as a question. Voyage does not read `schema.json`, does not write `cards.jsonl`, does not judge whether a claim is true, and does not produce a recommendation. Truth evaluation is a separate chat critic (`corroboration` on the card) that fetches cited URLs and a short web search. The free critic is Gemini (`GEMINI_API_KEY`, `--reasoner gemini`). Claude is the paid alternative. `--no-truth` keeps library-only coverage.
 
-If a step needs a sentence, a yes/no, or a new card, that is **Claude** (`--reasoner claude` / `--drafter claude`). Voyage is only the `--provider` on `build`, `query`, and the retrieval half of `recommend`.
+If a step needs a sentence, a yes/no, or a new card, that is **Gemini** by default (`--reasoner` and `--drafter` both default to `gemini`). Pass `--reasoner claude` or `--drafter claude` only if you have an Anthropic key. Voyage is only the `--provider` on `build`, `query`, and the retrieval half of `recommend`.
 
 ```
 you type a question
@@ -68,9 +68,9 @@ python embed_pipeline.py query --provider voyage \
 | Find near-duplicates of an existing card | `query --card <id>` | Embed that claim; rank neighbors |
 | Narrow to one pizza style or app surface | `query --text "..." --style neapolitan --target fermentation_lab_dashboard` | Same ranking, after hard filters |
 | Write a claim you already have | `add --claim "..."` | None until you `build` |
-| Draft cards from a URL / paste | `ingest --url ... --drafter claude` | After draft, Voyage scores each new claim against `cards.db` (`gap` / `refines` / `covered` / `duplicate`) |
+| Draft cards from a URL / paste | `ingest --url ... --drafter gemini` | After draft, Voyage scores each new claim against `cards.db` (`gap` / `refines` / `covered` / `duplicate`) |
 | Score whether the library is enough, no drafting | `recommend --provider voyage --reasoner none --threshold 0.7` | Retrieval knowledge only |
-| Validate / draft until a threshold, then recommend | `recommend --provider voyage --reasoner claude --threshold 0.7` | Retrieval score; Claude writes/validates |
+| Validate / draft until a threshold, then recommend | `recommend --provider voyage --reasoner gemini --threshold 0.7` | Retrieval score; Gemini writes/validates |
 
 Direction of travel: **write cards → build → query to see neighbors → edit `refines` / `contradicts` → build again.** Use `recommend` when the question is operational (“is this dough ready?”) and you care whether the library is *enough*, not just which card is closest.
 

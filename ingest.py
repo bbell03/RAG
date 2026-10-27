@@ -9,7 +9,7 @@ Add a drafter by writing `draft_*(doc, schema) -> list[dict]` and registering
 it on DRAFTERS. Voyage is not a drafter; it only embeds already-written claims.
 
 Safety:
-    scrape_url/file cap at MAX_FETCH_BYTES (2 MiB). Claude ingest truncates
+    scrape_url/file cap at MAX_FETCH_BYTES (2 MiB). Chat ingest truncates
     source text to MAX_DRAFT_CHARS. HTML parser is O(page size).
 """
 
@@ -294,18 +294,25 @@ def draft_template(doc: dict, schema: Optional[dict] = None) -> List[dict]:
 
 def draft_claude(doc: dict, schema: Optional[dict] = None) -> List[dict]:
     """Claude author path. Needs ANTHROPIC_API_KEY. Same return as draft_template."""
-    from synthesis import ClaudeBot
+    from synthesis import make_bot
 
-    return ClaudeBot().ingest(doc, schema)
+    return make_bot("claude").ingest(doc, schema)
 
 
-DRAFTERS = {"template": draft_template, "claude": draft_claude}
+def draft_gemini(doc: dict, schema: Optional[dict] = None) -> List[dict]:
+    """Gemini author path. Needs GEMINI_API_KEY. Same return as draft_template."""
+    from synthesis import make_bot
+
+    return make_bot("gemini").ingest(doc, schema)
+
+
+DRAFTERS = {"gemini": draft_gemini, "template": draft_template, "claude": draft_claude}
 
 
 def ingest(
     source: str,
     spec: str,
-    drafter: str = "template",
+    drafter: str = "gemini",
 ) -> List[dict]:
     """Scrape `spec` via SCRAPERS[source], then draft cards. Does not write jsonl."""
     if source not in SCRAPERS:

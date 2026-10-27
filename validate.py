@@ -3,11 +3,12 @@ Truth evaluation — critic stage after Voyage library coverage.
 
 Voyage answers "do we already have this?"
 This module answers "is the claim supported, contradicted, or unproven?"
-using library neighbors, cited URLs, a short web fetch, and Claude as critic.
+using library neighbors, cited URLs, a short web fetch, and a chat model as critic.
 
 Safety: at most MAX_PAGES pages, each truncated to MAX_PAGE_CHARS before
-they go to Claude. Search HTML is not kept. Missing ANTHROPIC_API_KEY is
-a skipped verdict, not a crash.
+they go to the critic. Search HTML is not kept. A missing API key is a
+skipped verdict, not a crash. Gemini (GEMINI_API_KEY) is the free critic;
+Claude (ANTHROPIC_API_KEY) is the paid one.
 """
 
 import os
@@ -153,34 +154,59 @@ def _parse_truth(payload: dict) -> dict:
     }
 
 
+def _skip(why: str) -> dict:
+    return {
+        "verdict": "skipped",
+        "score": 0.0,
+        "rationale": why,
+        "citations": [],
+        "contradicts": [],
+        "checked_at": date.today().isoformat(),
+    }
+
+
+def resolve_critic(critic: Optional[str] = None) -> Optional[str]:
+    """Pick claude or gemini. Explicit name wins. Otherwise the key that is set.
+
+    Gemini wins when both keys are set and no critic was requested, because
+    that path does not require an Anthropic bill. Returns None if neither key exists.
+    """
+    if critic in ("claude", "gemini"):
+        return critic
+    if os.environ.get("GEMINI_API_KEY"):
+        return "gemini"
+    if os.environ.get("ANTHROPIC_API_KEY"):
+        return "claude"
+    return None
+
+
 def evaluate_truth(
     claim: str,
     hits: List[Hit],
     extra_urls: Optional[List[str]] = None,
     use_web: bool = True,
+    critic: Optional[str] = None,
 ) -> dict:
-    """Claude critic: support / conflict / insufficient.
+    """Critic: support / conflict / insufficient.
 
     Contract:
         always returns a dict with verdict (including 'skipped').
         never raises on API/network failure — those become skipped.
         does not mutate hits. May fetch the network if use_web.
+        critic is 'claude', 'gemini', or None (whichever key is set).
     """
-    if not os.environ.get("ANTHROPIC_API_KEY"):
-        return {
-            "verdict": "skipped",
-            "score": 0.0,
-            "rationale": "ANTHROPIC_API_KEY not set; truth check needs Claude.",
-            "citations": [],
-            "contradicts": [],
-            "checked_at": date.today().isoformat(),
-        }
+    name = resolve_critic(critic)
+    if name is None:
+        return _skip("No GEMINI_API_KEY or ANTHROPIC_API_KEY; truth check skipped.")
+    needed = "GEMINI_API_KEY" if name == "gemini" else "ANTHROPIC_API_KEY"
+    if not os.environ.get(needed):
+        return _skip(f"{needed} not set; truth check needs {name}.")
 
     evidence = gather_evidence(claim, hits, extra_urls=extra_urls, use_web=use_web)
     try:
-        from synthesis import ClaudeBot
+        from synthesis import make_bot
 
-        payload = ClaudeBot().validate(claim, evidence)
+        payload = make_bot(name).validate(claim, evidence)
         result = _parse_truth(payload)
     except (ValueError, RuntimeError, KeyError, TypeError) as exc:
         return {

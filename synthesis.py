@@ -1,19 +1,23 @@
 """
-Claude bot — the generative side of this pipeline.
+Chat bots — the generative side of this pipeline.
 
-Voyage embeds and ranks. This module is the only place Claude writes or
-critiques claims:
+Voyage embeds and ranks. This module is the only place a chat model writes
+or critiques claims:
 
   ingest     source text → candidate cards          (author)
   validate   claim + evidence → support/conflict    (critic)
   synthesize question + cards → recommendation      (composer)
   reason     scores + truth + cards → next action   (planner; not wired yet)
 
-    python synthesis.py ingest --text "..."
-    python synthesis.py validate --claim "..."
+    python synthesis.py ingest --text "..." --bot gemini
+    python synthesis.py validate --claim "..." --bot gemini
 
-Safety: one request at a time, 90s timeout, max_tokens 1500. Error bodies
-truncated. Ingest source is sliced to MAX_DRAFT_CHARS before the prompt.
+Claude uses ANTHROPIC_API_KEY. Gemini 3.8 Flash uses GEMINI_API_KEY and is
+on Google's free tier (aistudio.google.com/apikey). Prompts sent on that
+free tier can be used to improve Google's products.
+
+Safety: one request at a time, 90s timeout. Error bodies truncated. Ingest
+source is sliced to MAX_DRAFT_CHARS before the prompt.
 """
 
 import argparse
@@ -21,60 +25,38 @@ import json
 import os
 from typing import List, Optional
 
-MODEL = "claude-sonnet-4-6"
-API_URL = "https://api.anthropic.com/v1/messages"
+CLAUDE_MODEL = "claude-sonnet-4-6"
+CLAUDE_URL = "https://api.anthropic.com/v1/messages"
+GEMINI_MODEL = "gemini-3.8-flash"
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+BOTS = ("gemini", "claude")
 
 
-class ClaudeBot:
-    """One Anthropic client: ingest / validate / synthesize / reason."""
+def _parse_json_text(text: str, label: str) -> dict:
+    """Strip a markdown fence and parse one JSON object."""
+    text = (text or "").strip()
+    if text.startswith("```"):
+        text = text.strip("`")
+        if text.startswith("json"):
+            text = text[4:]
+        text = text.strip()
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{label} returned non-JSON: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError(f"{label} returned non-object JSON")
+    return payload
 
-    def __init__(self, model: str = MODEL):
-        self.model = model
+
+class CardBot:
+    """Shared author / critic / composer prompts. Subclasses only speak HTTP."""
+
+    label = "model"
 
     def complete_json(self, user_content: str, system: Optional[str] = None) -> dict:
-        """POST Messages API and parse a JSON object from the text block.
-
-        Contract: returns dict. Raises RuntimeError (key/HTTP) or ValueError (bad JSON).
-        Note: does not retry. Prompt size is the caller's job to cap.
-        """
-        import requests
-
-        if not os.environ.get("ANTHROPIC_API_KEY"):
-            raise RuntimeError("ClaudeBot needs ANTHROPIC_API_KEY. Voyage only embeds.")
-        body = {
-            "model": self.model,
-            "max_tokens": 1500,
-            "temperature": 0.2,
-            "messages": [{"role": "user", "content": user_content}],
-        }
-        if system:
-            body["system"] = system
-        resp = requests.post(
-            API_URL,
-            headers={
-                "x-api-key": os.environ["ANTHROPIC_API_KEY"],
-                "anthropic-version": "2023-06-01",
-                "Content-Type": "application/json",
-            },
-            json=body,
-            timeout=90,
-        )
-        if not resp.ok:
-            raise RuntimeError(f"{resp.status_code} from Anthropic: {resp.text[:800]}")
-        parts = [b.get("text", "") for b in resp.json().get("content", []) if b.get("type") == "text"]
-        text = "\n".join(parts).strip()
-        if text.startswith("```"):
-            text = text.strip("`")
-            if text.startswith("json"):
-                text = text[4:]
-            text = text.strip()
-        try:
-            payload = json.loads(text)
-        except json.JSONDecodeError as exc:
-            raise ValueError(f"Claude returned non-JSON: {exc}") from exc
-        if not isinstance(payload, dict):
-            raise ValueError("Claude returned non-object JSON")
-        return payload
+        """Return one JSON object. Raises RuntimeError (key/HTTP) or ValueError (bad JSON)."""
+        raise NotImplementedError
 
     def ingest(self, doc: dict, schema: Optional[dict] = None) -> List[dict]:
         """Author: source doc → 1–4 schema cards.
@@ -107,7 +89,7 @@ class ClaudeBot:
         )
         raw_cards = payload.get("cards")
         if not isinstance(raw_cards, list) or not raw_cards:
-            raise ValueError("ClaudeBot.ingest returned no cards")
+            raise ValueError(f"{self.label}.ingest returned no cards")
         taken = load_card_ids()
         return [normalize_card(raw, doc, enums, taken) for raw in raw_cards]
 
@@ -204,14 +186,14 @@ class ClaudeBot:
               "why": str,
             }
 
-        Policy (pseudocode — local, no extra Claude call yet)::
+        Policy (pseudocode — local, no extra model call)::
 
             if truth.verdict == "conflict":
                 return refuse     # do not advise; sources disagree
             if truth.verdict == "insufficient" and retrieval < threshold:
                 return fetch      # need a cited page or another card
             if retrieval < threshold or (coverage is not None and coverage < threshold):
-                return draft      # library gap → ClaudeBot.ingest / synthesize cards
+                return draft      # library gap → ingest / synthesize cards
             if truth.verdict in (None, "skipped") and retrieval >= threshold:
                 return validate   # library looks full; still need a critic pass
             if retrieval >= threshold and truth.verdict == "support":
@@ -246,6 +228,107 @@ class ClaudeBot:
         }
 
 
+class ClaudeBot(CardBot):
+    """Anthropic client. Needs ANTHROPIC_API_KEY."""
+
+    label = "Claude"
+
+    def __init__(self, model: str = CLAUDE_MODEL):
+        self.model = model
+
+    def complete_json(self, user_content: str, system: Optional[str] = None) -> dict:
+        """POST Messages API and parse a JSON object from the text block.
+
+        Contract: returns dict. Raises RuntimeError (key/HTTP) or ValueError (bad JSON).
+        Note: does not retry. Prompt size is the caller's job to cap.
+        """
+        import requests
+
+        if not os.environ.get("ANTHROPIC_API_KEY"):
+            raise RuntimeError("ClaudeBot needs ANTHROPIC_API_KEY. Voyage only embeds.")
+        body = {
+            "model": self.model,
+            "max_tokens": 1500,
+            "temperature": 0.2,
+            "messages": [{"role": "user", "content": user_content}],
+        }
+        if system:
+            body["system"] = system
+        resp = requests.post(
+            CLAUDE_URL,
+            headers={
+                "x-api-key": os.environ["ANTHROPIC_API_KEY"],
+                "anthropic-version": "2023-06-01",
+                "Content-Type": "application/json",
+            },
+            json=body,
+            timeout=90,
+        )
+        if not resp.ok:
+            raise RuntimeError(f"{resp.status_code} from Anthropic: {resp.text[:800]}")
+        parts = [b.get("text", "") for b in resp.json().get("content", []) if b.get("type") == "text"]
+        return _parse_json_text("\n".join(parts), self.label)
+
+
+class GeminiBot(CardBot):
+    """Gemini Flash client. Needs GEMINI_API_KEY. Default model is on the free tier."""
+
+    label = "Gemini"
+
+    def __init__(self, model: Optional[str] = None):
+        self.model = model or os.environ.get("GEMINI_MODEL") or GEMINI_MODEL
+
+    def complete_json(self, user_content: str, system: Optional[str] = None) -> dict:
+        """POST generateContent and parse a JSON object.
+
+        Thinking is pinned to low so the token budget is left for the JSON.
+        Temperature is omitted: Gemini 3.6+ ignores it. Does not retry.
+        """
+        import requests
+
+        if not os.environ.get("GEMINI_API_KEY"):
+            raise RuntimeError(
+                "GeminiBot needs GEMINI_API_KEY. Free key: https://aistudio.google.com/apikey. Voyage only embeds."
+            )
+        body = {
+            "contents": [{"role": "user", "parts": [{"text": user_content}]}],
+            "generationConfig": {
+                "maxOutputTokens": 4096,
+                "responseMimeType": "application/json",
+                "thinkingConfig": {"thinkingLevel": "low"},
+            },
+        }
+        if system:
+            body["systemInstruction"] = {"parts": [{"text": system}]}
+        resp = requests.post(
+            GEMINI_URL.format(model=self.model),
+            headers={
+                "x-goog-api-key": os.environ["GEMINI_API_KEY"],
+                "Content-Type": "application/json",
+            },
+            json=body,
+            timeout=90,
+        )
+        if not resp.ok:
+            raise RuntimeError(f"{resp.status_code} from Gemini: {resp.text[:800]}")
+        data = resp.json()
+        candidates = data.get("candidates") or []
+        if not candidates:
+            raise RuntimeError(f"Gemini returned no candidates: {json.dumps(data)[:800]}")
+        parts = ((candidates[0].get("content") or {}).get("parts") or [])
+        texts = [p.get("text", "") for p in parts if not p.get("thought")]
+        return _parse_json_text("\n".join(texts), self.label)
+
+
+def make_bot(name: str = "gemini") -> CardBot:
+    """gemini → GeminiBot (default), claude → ClaudeBot."""
+    if name == "gemini":
+        return GeminiBot()
+    if name == "claude":
+        return ClaudeBot()
+    raise ValueError(f"unknown bot {name!r}. bots: {list(BOTS)}")
+
+
 def claude_json(user_content: str, system: Optional[str] = None) -> dict:
     """Module-level shortcut. Same contract as ClaudeBot.complete_json."""
     return ClaudeBot().complete_json(user_content, system=system)
@@ -253,14 +336,15 @@ def claude_json(user_content: str, system: Optional[str] = None) -> dict:
 
 def main() -> None:
     """CLI: ingest --text/--url, or validate --claim. Prints JSON to stdout."""
-    p = argparse.ArgumentParser(description="Claude bot for ingest and validation.")
+    p = argparse.ArgumentParser(description="Chat bot for ingest and validation.")
     p.add_argument("action", choices=["ingest", "validate"])
+    p.add_argument("--bot", default="gemini", choices=list(BOTS), help="gemini is the free tier. claude needs ANTHROPIC_API_KEY.")
     p.add_argument("--text", default=None, help="Source text for ingest")
     p.add_argument("--url", default=None, help="Source URL for ingest")
     p.add_argument("--claim", default=None, help="Claim to validate")
     p.add_argument("--no-web", action="store_true")
     args = p.parse_args()
-    bot = ClaudeBot()
+    bot = make_bot(args.bot)
 
     if args.action == "ingest":
         from ingest import scrape_text, scrape_url
@@ -281,7 +365,7 @@ def main() -> None:
         p.error("validate needs --claim")
     from validate import evaluate_truth
 
-    print(json.dumps(evaluate_truth(claim, [], extra_urls=[], use_web=not args.no_web), indent=2))
+    print(json.dumps(evaluate_truth(claim, [], extra_urls=[], use_web=not args.no_web, critic=args.bot), indent=2))
 
 
 if __name__ == "__main__":

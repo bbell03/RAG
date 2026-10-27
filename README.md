@@ -4,7 +4,7 @@ This repository implements a small, modular retrieval-and-verification system fo
 
 - Voyage for embeddings and semantic retrieval
 - SQLite for a local vector-style card index
-- Claude for drafting, validation, and recommendation synthesis
+- Gemini Flash (free tier) or Claude for drafting, validation, and recommendation synthesis
 - JSONL card records as the source-of-truth knowledge library
 
 The core idea is to store research knowledge as atomic, schema-validated "insight cards" and then:
@@ -141,7 +141,7 @@ What it includes:
 - `load_schema()` and `schema_enums()` to read and normalize schema constraints
 - `scrape_url()`, `scrape_file()`, and `scrape_text()` for ingest sources
 - `normalize_card()` to convert raw drafts into validated card records
-- `draft_template()` and `draft_claude()` to generate candidate cards from raw text
+- `draft_gemini()` (default), `draft_template()`, and `draft_claude()` to generate candidate cards from raw text
 - `commit_candidates()` to append new cards to `cards.jsonl`
 
 Key behaviors:
@@ -183,12 +183,12 @@ What it includes:
 - `classify_coverage()` to label the gap state (`duplicate`, `covered`, `refines`, `gap`)
 - `assess_drafts()` to evaluate candidate cards against existing neighbors
 - `recommend()` to execute a retrieval → score → optional draft loop
-- `REASONERS` with `none` and `claude` options
+- `REASONERS` with `none`, `gemini`, and `claude` options
 
 Behavior:
 - initial retrieval is based on embeddings
 - a reasoner may decide if the library is sufficient or if more cards should be drafted
-- optional Claude synthesize step may propose missing knowledge cards
+- optional Gemini or Claude synthesize step may propose missing knowledge cards
 - this loop caps itself with `max_rounds` and guards against excessive recursion
 
 ### `validate.py`
@@ -199,11 +199,11 @@ What it includes:
 - `is_url()` to guard URL validation
 - `_ddg_urls()` to gather candidate search results
 - `gather_evidence()` to collect nearby library cards and web pages
-- `evaluate_truth()` to ask Claude to judge a claim as support/conflict/insufficient
+- `evaluate_truth()` to ask Gemini or Claude to judge a claim as support/conflict/insufficient
 - `apply_truth()` to blend library coverage with evidence truth into a final score
 
 Behavior:
-- if `ANTHROPIC_API_KEY` is absent, truth checks are skipped, not crashed
+- if neither `GEMINI_API_KEY` nor `ANTHROPIC_API_KEY` is set, truth checks are skipped, not crashed
 - if web fetches fail, the system still returns a degraded verdict instead of failing completely
 - this module answers: "is this claim actually supported by evidence?"
 
@@ -212,15 +212,13 @@ Behavior:
 Purpose: the generative LLM layer that writes or critiques cards.
 
 What it includes:
-- `ClaudeBot.complete_json()` to call Anthropic Messages API and parse JSON responses
-- `ClaudeBot.ingest()` to draft candidate insight cards from source text
-- `ClaudeBot.validate()` to judge a claim against evidence
-- `ClaudeBot.synthesize()` to produce a recommendation and any missing cards
-- `ClaudeBot.reason()` to decide the next best action based on retrieval + truth
+- `CardBot` prompts shared by both clients: ingest, validate, synthesize, reason
+- `GeminiBot` for the free Gemini Flash API (`GEMINI_API_KEY`)
+- `ClaudeBot` for the Anthropic Messages API (`ANTHROPIC_API_KEY`)
 
 Behavior:
 - all responses are structured as JSON
-- this is the only module that speaks to Anthropic directly
+- this is the only module that speaks to Gemini or Anthropic directly
 - it is intentionally separated from retrieval logic so you can swap out the model or call another provider later
 
 ### `VOYAGE.md`
@@ -281,7 +279,7 @@ Use when you have a candidate fact and want to know if it is supported or contra
 Example:
 
 ```bash
-python embed_pipeline.py recommend --provider voyage --reasoner claude \
+python embed_pipeline.py recommend --provider voyage --reasoner gemini \
   --text "is this Neapolitan dough ready to bake" \
   --threshold 0.7 --commit
 ```
@@ -314,13 +312,13 @@ Typical pattern:
 
 1. Retrieve relevant nearby cards using `embed_pipeline.py query`
 2. Build a question or claim
-3. Call `recommend` with `--reasoner claude`
+3. Call `recommend` with `--reasoner gemini`
 4. Let Claude decide whether the library is ready and whether to draft missing cards
 
 Example:
 
 ```bash
-python embed_pipeline.py recommend --provider voyage --reasoner claude \
+python embed_pipeline.py recommend --provider voyage --reasoner gemini \
   --text "How can I tell if a Neapolitan dough has over-proofed?" \
   --threshold 0.7
 ```
@@ -344,7 +342,8 @@ Set required environment variables:
 
 ```bash
 export VOYAGE_API_KEY=...
-export ANTHROPIC_API_KEY=...   # needed for drafting/validation/recommendation with Claude
+export GEMINI_API_KEY=...      # free key from https://aistudio.google.com/apikey
+# export ANTHROPIC_API_KEY=... # only if you use --reasoner claude / --drafter claude
 ```
 
 Build the initial index:
@@ -372,7 +371,7 @@ python embed_pipeline.py add --provider voyage \
 Recommend or validate a claim:
 
 ```bash
-python embed_pipeline.py recommend --provider voyage --reasoner claude \
+python embed_pipeline.py recommend --provider voyage --reasoner gemini \
   --text "is this Neapolitan dough ready to bake" \
   --threshold 0.7 --commit
 ```
@@ -381,9 +380,9 @@ python embed_pipeline.py recommend --provider voyage --reasoner claude \
 
 - `cards.jsonl` is the source-of-truth; `cards.db` is derived
 - after editing `cards.jsonl`, always rebuild the index
-- Voyage handles embeddings and retrieval only; Claude handles drafting and truth evaluation
+- Voyage handles embeddings and retrieval only; Gemini (or Claude) handles drafting and truth evaluation
 - claim verification depends on evidence, not just nearest neighbors
-- if `ANTHROPIC_API_KEY` is missing, the truth step is skipped rather than crashing
+- if neither `GEMINI_API_KEY` nor `ANTHROPIC_API_KEY` is set, the truth step is skipped rather than crashing
 - use `--no-web` or `--no-truth` when you want to simplify or isolate retrieval behavior
 
 ## Recommended mental model
@@ -420,7 +419,7 @@ python embed_pipeline.py add --claim "Dough should feel springy, not wet, before
 python embed_pipeline.py build --provider voyage
 
 # 3) run a recommendation / check
-python embed_pipeline.py recommend --provider voyage --reasoner claude \
+python embed_pipeline.py recommend --provider voyage --reasoner gemini \
   --text "when should I stop proofing Neapolitan dough?" \
   --threshold 0.7
 ```

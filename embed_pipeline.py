@@ -6,15 +6,15 @@ Turns cards.jsonl (schema.json) into a queryable vector index.
 
 Usage:
     export VOYAGE_API_KEY=...
-    export ANTHROPIC_API_KEY=...   # Claude drafts / validates; Voyage only embeds
+    export GEMINI_API_KEY=...      # free Gemini drafts / validates; Voyage only embeds
     python embed_pipeline.py build --provider voyage
     python embed_pipeline.py query --provider voyage --card windowpane-neapolitan-periodic
     python embed_pipeline.py query --text "how long should Neapolitan dough ferment"
     python embed_pipeline.py add --claim "For Neapolitan dough, poke-test spring-back beats clock time."
+    python embed_pipeline.py recommend --provider voyage \\
+        --text "is this Neapolitan dough ready to bake" --threshold 0.7 --commit
     python embed_pipeline.py recommend --provider voyage --reasoner none \\
         --text "is this Neapolitan dough ready to bake" --threshold 0.7
-    python embed_pipeline.py recommend --provider voyage --reasoner claude \\
-        --text "is this Neapolitan dough ready to bake" --threshold 0.7 --commit
 
 Swap in your own embedding provider by adding a function to PROVIDERS below —
 everything else (storage, filtering, ranking) is provider-agnostic.
@@ -388,17 +388,19 @@ def _print_draft_coverage(cards, args) -> None:
         return query(claim, provider=args.provider, top_k=args.top_k)
 
     try:
+        critic = args.drafter if args.drafter in ("claude", "gemini") else None
         reports = assess_drafts(
             cards,
             retrieve,
             check_truth=not args.no_truth,
             use_web=not args.no_web,
+            critic=critic,
         )
     except (RuntimeError, KeyError, ValueError) as exc:
         print(f"coverage skipped: {exc}")
         return
 
-    print("coverage (Voyage library + Claude truth):")
+    print("coverage (Voyage library + truth critic):")
     gaps = 0
     for row in reports:
         truth = row.get("truth") or {}
@@ -573,7 +575,7 @@ def main():
     p.add_argument("--text", default=None, help="Query text, pasted ingest text, or claim if --claim is omitted")
     p.add_argument("--url", default=None, help="Article URL to scrape (ingest)")
     p.add_argument("--file", default=None, help="Local html/txt file to ingest")
-    p.add_argument("--drafter", default="template", choices=list(DRAFTERS.keys()), help="How to turn source text into cards. Voyage is not a drafter.")
+    p.add_argument("--drafter", default="gemini", choices=list(DRAFTERS.keys()), help="Default gemini. template writes a shell. claude needs ANTHROPIC_API_KEY.")
     p.add_argument("--out", default=CANDIDATES_PATH, help="Where to write drafted cards (default candidates.jsonl)")
     p.add_argument("--neighbors", action="store_true", help="Deprecated: ingest/add always run a Voyage coverage check")
     p.add_argument("--commit", action="store_true", help="Append drafted cards to cards.jsonl (still run build after)")
@@ -582,11 +584,11 @@ def main():
     p.add_argument("--variable", default=None, help="Override variable filter. Default is inferred from --text.")
     p.add_argument("--target", default=None, help="Override relevance_target filter. Default comes from --card or --text. Use 'all' to disable.")
     p.add_argument("--top-k", type=int, default=5)
-    p.add_argument("--reasoner", default="none", choices=list(REASONERS.keys()), help="none = Voyage score only. claude validates and may draft cards.")
+    p.add_argument("--reasoner", default="gemini", choices=list(REASONERS.keys()), help="Default gemini. none = Voyage score only. claude needs ANTHROPIC_API_KEY.")
     p.add_argument("--threshold", type=float, default=0.7, help="Knowledge score required before a recommendation is issued")
     p.add_argument("--max-rounds", type=int, default=2, help="Retrieve → validate/draft loops before giving up")
     p.add_argument("--prompt", default=None, help="Extra instructions for the reasoner prompt")
-    p.add_argument("--no-truth", action="store_true", help="Skip Claude truth evaluation (library coverage only)")
+    p.add_argument("--no-truth", action="store_true", help="Skip the chat-model truth evaluation (library coverage only)")
     p.add_argument("--no-web", action="store_true", help="Do not fetch cited URLs or search the web during truth checks")
     args = p.parse_args()
 

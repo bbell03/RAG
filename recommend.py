@@ -5,7 +5,7 @@ validates the answer and drafts missing cards until a knowledge threshold.
 Voyage does not run prompts. It only embeds. Plug a reasoner in REASONERS
 the same way embed providers are registered.
 
-Safety: each recommend round may call Voyage + Claude + web fetches.
+Safety: each recommend round may call Voyage + one chat model + web fetches.
 max_rounds caps the loop. Drafts stay in memory until write_candidates.
 """
 
@@ -79,8 +79,9 @@ def assess_drafts(
     retrieve_fn: Callable[[str], List[Hit]],
     check_truth: bool = True,
     use_web: bool = True,
+    critic: Optional[str] = None,
 ) -> List[dict]:
-    """Voyage library coverage, then Claude truth evaluation.
+    """Voyage library coverage, then a chat-model truth evaluation.
 
     Mutates each draft in-place with corroboration (and maybe contradicts).
     retrieve_fn is called once per draft — each call may hit Voyage.
@@ -95,7 +96,7 @@ def assess_drafts(
         if is_url(ref):
             extra.append(ref)
         if check_truth:
-            truth = evaluate_truth(card["claim"], row["hits"], extra_urls=extra, use_web=use_web)
+            truth = evaluate_truth(card["claim"], row["hits"], extra_urls=extra, use_web=use_web, critic=critic)
             row["truth"] = truth
             card["corroboration"] = {k: truth[k] for k in ("verdict", "score", "rationale", "citations", "contradicts", "checked_at") if k in truth}
             if truth.get("contradicts"):
@@ -174,24 +175,25 @@ def reason_none(
         "gaps": (
             []
             if ready
-            else ["Retrieval knowledge is below threshold. Add cards, or rerun with --reasoner claude."]
+            else ["Retrieval knowledge is below threshold. Add cards, or rerun with --reasoner gemini."]
         ),
         "cards": [],
     }
 
 
-def reason_claude(
+def _reason_with(
+    name: str,
     question: str,
     hits: List[Hit],
     retrieval: float,
     threshold: float,
     extra: Optional[str] = None,
 ) -> dict:
-    """Claude composer: coverage, recommendation, and optional gap cards."""
-    from synthesis import ClaudeBot
+    """Chat composer: coverage, recommendation, and optional gap cards."""
+    from synthesis import make_bot
 
     return _parse_reasoner_json(
-        ClaudeBot().synthesize(
+        make_bot(name).synthesize(
             question,
             _hits_payload(hits),
             retrieval,
@@ -201,7 +203,29 @@ def reason_claude(
     )
 
 
-REASONERS = {"none": reason_none, "claude": reason_claude}
+def reason_claude(
+    question: str,
+    hits: List[Hit],
+    retrieval: float,
+    threshold: float,
+    extra: Optional[str] = None,
+) -> dict:
+    """Claude composer. Needs ANTHROPIC_API_KEY."""
+    return _reason_with("claude", question, hits, retrieval, threshold, extra)
+
+
+def reason_gemini(
+    question: str,
+    hits: List[Hit],
+    retrieval: float,
+    threshold: float,
+    extra: Optional[str] = None,
+) -> dict:
+    """Gemini composer. Needs GEMINI_API_KEY."""
+    return _reason_with("gemini", question, hits, retrieval, threshold, extra)
+
+
+REASONERS = {"gemini": reason_gemini, "none": reason_none, "claude": reason_claude}
 
 
 def cards_from_reasoner(raw_cards: List[dict], question: str) -> List[dict]:
@@ -253,7 +277,7 @@ def recommend(
     embed_fn: Callable,
     card_text_fn: Callable[[dict], str],
     cosine_fn: Callable,
-    reasoner: str = "none",
+    reasoner: str = "gemini",
     threshold: float = 0.7,
     max_rounds: int = 2,
     extra_prompt: Optional[str] = None,
@@ -262,8 +286,9 @@ def recommend(
     out_path: str = CANDIDATES_PATH,
     check_truth: bool = True,
     use_web: bool = True,
+    critic: Optional[str] = None,
 ) -> dict:
-    """Retrieve → score → optional Claude compose/truth → maybe draft, up to max_rounds.
+    """Retrieve → score → optional chat compose/truth → maybe draft, up to max_rounds.
 
     Returns a report dict (ready, recommendation, hits, drafted, rounds).
     Writes candidates only if any cards were drafted. Does not rebuild cards.db.
@@ -280,6 +305,8 @@ def recommend(
     report = []
 
     hits = retrieve_fn()
+    if critic is None and reasoner in ("claude", "gemini"):
+        critic = reasoner
     for round_i in range(1, max_rounds + 1):
         if drafted:
             hits = merge_hits(question, hits, drafted, embed_fn, card_text_fn, cosine_fn, top_k)
@@ -287,14 +314,14 @@ def recommend(
         verdict = REASONERS[reasoner](question, hits, retrieval, threshold, extra_prompt)
         last_reason = verdict
         library = combined_score(retrieval, verdict.get("coverage"))
-        truth = evaluate_truth(question, hits, use_web=use_web) if check_truth else {"verdict": "skipped"}
+        truth = evaluate_truth(question, hits, use_web=use_web, critic=critic) if check_truth else {"verdict": "skipped"}
         score, truth_ok = apply_truth(library, truth)
         new_cards = cards_from_reasoner(verdict.get("cards") or [], question)
         # Don't re-add claims we already drafted this run.
         have = {c["claim"] for c in drafted}
         fresh = [c for c in new_cards if c["claim"] not in have]
         if check_truth and fresh:
-            assess_drafts(fresh, lambda claim: hits, check_truth=True, use_web=use_web)
+            assess_drafts(fresh, lambda claim: hits, check_truth=True, use_web=use_web, critic=critic)
         drafted.extend(fresh)
         ready = bool(verdict.get("ready") and score >= threshold and truth_ok is not False)
         report.append(
