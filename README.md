@@ -182,6 +182,7 @@ Each insight card represents **one atomic, falsifiable claim** about dough behav
 ### Automatic Retries & Backoff
 
 - Calls to Gemini in [`synthesis.py`](file:///Users/brandonbell/Desktop/RAG/synthesis.py) include automatic exponential backoff retry logic (up to 4 attempts) handling transient `503`, `429` (rate limits), and connection/read timeouts.
+- After those retries are exhausted, the same prompt is sent to a local OpenAI-compatible model when `LOCAL_LLM_URL` and `LOCAL_LLM_MODEL` are set (Ollama at `http://127.0.0.1:11434/v1`, or LM Studio at `http://127.0.0.1:1234/v1`). `--bot local`, `--drafter local`, and `--reasoner local` skip the cloud call. This fallback covers the chat prompts only. Voyage embeddings still need `VOYAGE_API_KEY`.
 
 ### Offline & Web Modes
 

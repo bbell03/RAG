@@ -175,17 +175,22 @@ def _skip(why: str) -> dict:
 
 
 def resolve_critic(critic: Optional[str] = None) -> Optional[str]:
-    """Pick claude or gemini. Explicit name wins. Otherwise the key that is set.
+    """Pick claude, gemini, or local. Explicit name wins. Otherwise the key that is set.
 
-    Gemini wins when both keys are set and no critic was requested, because
-    that path does not require an Anthropic bill. Returns None if neither key exists.
+    Gemini wins when both cloud keys are set and no critic was requested, because
+    that path does not require an Anthropic bill. A configured local model is
+    used when neither cloud key exists. Returns None if nothing is configured.
     """
-    if critic in ("claude", "gemini"):
+    if critic in ("claude", "gemini", "local"):
         return critic
     if os.environ.get("GEMINI_API_KEY"):
         return "gemini"
     if os.environ.get("ANTHROPIC_API_KEY"):
         return "claude"
+    from synthesis import local_bot_configured
+
+    if local_bot_configured():
+        return "local"
     return None
 
 
@@ -202,14 +207,20 @@ def evaluate_truth(
         always returns a dict with verdict (including 'skipped').
         never raises on API/network failure — those become skipped.
         does not mutate hits. May fetch the network if use_web.
-        critic is 'claude', 'gemini', or None (whichever key is set).
+        critic is 'claude', 'gemini', 'local', or None (whichever key is set).
     """
     name = resolve_critic(critic)
     if name is None:
-        return _skip("No GEMINI_API_KEY or ANTHROPIC_API_KEY; truth check skipped.")
-    needed = "GEMINI_API_KEY" if name == "gemini" else "ANTHROPIC_API_KEY"
-    if not os.environ.get(needed):
-        return _skip(f"{needed} not set; truth check needs {name}.")
+        return _skip("No GEMINI_API_KEY, ANTHROPIC_API_KEY, or local model; truth check skipped.")
+    if name != "local":
+        needed = "GEMINI_API_KEY" if name == "gemini" else "ANTHROPIC_API_KEY"
+        if not os.environ.get(needed):
+            from synthesis import local_bot_configured
+
+            if local_bot_configured():
+                name = "local"
+            else:
+                return _skip(f"{needed} not set; truth check needs {name}.")
 
     evidence = gather_evidence(claim, hits, extra_urls=extra_urls, use_web=use_web)
     try:

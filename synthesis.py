@@ -16,6 +16,10 @@ Claude uses ANTHROPIC_API_KEY. Gemini 3.8 Flash uses GEMINI_API_KEY and is
 on Google's free tier (aistudio.google.com/apikey). Prompts sent on that
 free tier can be used to improve Google's products.
 
+A local OpenAI-compatible server (Ollama, LM Studio, llama.cpp) can take the
+same prompt when the cloud model is out of quota or unreachable. Set
+LOCAL_LLM_URL and LOCAL_LLM_MODEL. Pass --bot local to skip the cloud call.
+
 Safety: one request at a time, 90s timeout. Error bodies truncated. Ingest
 source is sliced to MAX_DRAFT_CHARS before the prompt.
 """
@@ -59,7 +63,9 @@ CLAUDE_MODEL = "claude-sonnet-4-6"
 CLAUDE_URL = "https://api.anthropic.com/v1/messages"
 GEMINI_MODEL = "gemini-3.8-flash"
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-BOTS = ("gemini", "claude")
+BOTS = ("gemini", "claude", "local")
+# Status codes that mean "this cloud model cannot answer right now".
+_UNAVAILABLE_STATUS = (401, 403, 408, 429, 500, 502, 503, 504, 529)
 
 
 def _parse_json_text(text: str, label: str) -> dict:
@@ -257,6 +263,131 @@ class CardBot:
             "n_cards": len(cards),
         }
 
+    def plan_claim(self, card: dict, evidence: dict, library: Optional[List[dict]] = None) -> dict:
+        """Controller planner: one card + fresh evidence → library edits.
+
+        Does not write cards.jsonl. The caller (passive-research) decides
+        what to stage or commit.
+
+        Returns
+            action          validate | modify | remove | skip
+            revised_claim   one sentence, only when action is modify
+            why             short rationale
+            adds            0–2 new atomic claims the evidence states that
+                            this card does not already say
+            propagations    0–3 learning cards derived from this one:
+                            direction "specialize" (style, phase, or workflow
+                            target) or "expand" (broader style or new variable)
+        """
+        from ingest import schema_enums
+
+        enums = schema_enums()
+        neighbors = []
+        for item in (library or [])[:24]:
+            neighbors.append(
+                {
+                    "id": item.get("id"),
+                    "claim": (item.get("claim") or "")[:240],
+                    "style_scope": item.get("style_scope"),
+                    "phase": item.get("phase"),
+                    "variables": item.get("variables"),
+                    "relevance_targets": item.get("relevance_targets"),
+                    "refines": item.get("refines"),
+                }
+            )
+        payload = self.complete_json(
+            (
+                "You maintain an atomic pizza-dough claim library.\n"
+                "Given one existing card and fresh evidence, choose a single action:\n"
+                "- validate: evidence supports the claim as written. revised_claim null.\n"
+                "- modify: evidence supports a corrected or narrower sentence. "
+                "revised_claim is one falsifiable sentence. Same fact, fixed scope or mechanism. "
+                "Do not invent measurements.\n"
+                "- remove: the mechanism is contradicted and cannot be repaired by a narrower true claim.\n"
+                "- skip: evidence is insufficient, off-topic, or only restates the claim.\n"
+                "Also return learning drafts when action is validate or modify.\n"
+                "adds: 0-2 NEW claims the evidence actually states, not paraphrases of this card, "
+                "not duplicates of library neighbors. confidence at most 0.45.\n"
+                "propagations: 0-3 cards that spread this claim into learning workflows.\n"
+                "  specialize: same mechanism, but a different style_scope, phase, or relevance_target "
+                "so a lab, cart, or mise workflow can use it. Set direction to specialize.\n"
+                "  expand: a broader style (often general) or an adjacent variable the evidence supports. "
+                "Set direction to expand.\n"
+                "Do not copy the parent claim verbatim. One sentence each. status draft.\n"
+                f"Preferred variables: {enums['variables']} (other slugs ok)\n"
+                f"Preferred style_scope: {enums['style_scope']} (other slugs ok)\n"
+                f"Preferred phase: {enums['phase']}\n"
+                f"kind: {enums['kind']}\n"
+                f"Preferred relevance_targets: {enums['relevance_targets']}\n"
+                "Workflow targets you may specialize into: fermentation_lab_dashboard, "
+                "pizza_cart_app, mise_en_place, general_reference.\n"
+                "Return JSON only:\n"
+                '{"action": "validate|modify|remove|skip", "revised_claim": null, "why": "...", '
+                '"adds": [{"claim": "...", "variables": [], "style_scope": [], "phase": [], '
+                '"kind": null, "confidence": 0.4, "relevance_targets": []}], '
+                '"propagations": [{"claim": "...", "direction": "specialize|expand", '
+                '"variables": [], "style_scope": [], "phase": [], "kind": null, '
+                '"confidence": 0.4, "relevance_targets": []}]}\n\n'
+                f"card: {json.dumps({'id': card.get('id'), 'claim': card.get('claim'), 'variables': card.get('variables'), 'style_scope': card.get('style_scope'), 'phase': card.get('phase'), 'relevance_targets': card.get('relevance_targets'), 'refines': card.get('refines')}, ensure_ascii=False)}\n"
+                f"evidence: {json.dumps(evidence, ensure_ascii=False)[:6000]}\n"
+                f"library: {json.dumps(neighbors, ensure_ascii=False)[:6000]}\n"
+            ),
+            system="You edit a dough-research claim library from evidence. Reply with JSON only.",
+        )
+        return _normalize_claim_plan(payload)
+
+
+def _normalize_claim_plan(payload: dict) -> dict:
+    """Clamp a plan_claim payload onto the controller contract."""
+    action = str(payload.get("action") or "skip").strip().lower()
+    if action not in ("validate", "modify", "remove", "skip"):
+        action = "skip"
+    revised = payload.get("revised_claim")
+    revised = " ".join(str(revised).split()).strip() if revised else None
+    if action == "modify" and not revised:
+        action = "validate"
+    if action != "modify":
+        revised = None
+    why = " ".join(str(payload.get("why") or "").split()).strip()[:500]
+
+    def _drafts(key: str, limit: int) -> List[dict]:
+        raw = payload.get(key) or []
+        if not isinstance(raw, list):
+            return []
+        out = []
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            claim = " ".join(str(item.get("claim") or "").split()).strip()
+            if not claim:
+                continue
+            direction = str(item.get("direction") or item.get("mode") or "").strip().lower()
+            if direction not in ("specialize", "expand"):
+                direction = ""
+            out.append(
+                {
+                    "claim": claim,
+                    "direction": direction,
+                    "variables": item.get("variables") or [],
+                    "style_scope": item.get("style_scope") or [],
+                    "phase": item.get("phase") or [],
+                    "kind": item.get("kind"),
+                    "confidence": item.get("confidence", 0.4),
+                    "relevance_targets": item.get("relevance_targets") or [],
+                }
+            )
+            if len(out) >= limit:
+                break
+        return out
+
+    return {
+        "action": action,
+        "revised_claim": revised,
+        "why": why or "No rationale provided.",
+        "adds": _drafts("adds", 2),
+        "propagations": _drafts("propagations", 3),
+    }
+
 
 class ClaudeBot(CardBot):
     """Anthropic client. Needs ANTHROPIC_API_KEY."""
@@ -368,13 +499,141 @@ class GeminiBot(CardBot):
             raise last_err
 
 
+def local_bot_configured() -> bool:
+    """True when both the local server URL and a model name are set."""
+    return bool((os.environ.get("LOCAL_LLM_URL") or "").strip() and (os.environ.get("LOCAL_LLM_MODEL") or "").strip())
+
+
+def _chat_completions_url(base: str) -> str:
+    """OpenAI-compatible chat URL. Accepts a root, a /v1 base, or the full path."""
+    root = (base or "").rstrip("/")
+    if root.endswith("/chat/completions"):
+        return root
+    if root.endswith("/v1"):
+        return root + "/chat/completions"
+    return root + "/v1/chat/completions"
+
+
+def _cloud_unavailable(exc: BaseException) -> bool:
+    """True for quota, overload, missing cloud keys, and connection failures.
+
+    A 400 or a JSON parse error is not unavailability. Those stay on the caller.
+    """
+    if type(exc).__name__ in ("Timeout", "ConnectTimeout", "ReadTimeout", "ConnectionError"):
+        return True
+    text = str(exc)
+    if "GEMINI_API_KEY" in text or "ANTHROPIC_API_KEY" in text:
+        return True
+    lowered = text.lower()
+    if "no candidates" in lowered:
+        return True
+    for code in _UNAVAILABLE_STATUS:
+        if text.startswith(f"{code} ") or f"{code} from " in text:
+            return True
+    return any(token in lowered for token in ("quota", "resource_exhausted", "unavailable", "overloaded", "timed out"))
+
+
+class LocalBot(CardBot):
+    """OpenAI-compatible local server. Ollama, LM Studio, and llama.cpp all speak this.
+
+    Needs LOCAL_LLM_URL (for example http://127.0.0.1:11434/v1) and LOCAL_LLM_MODEL.
+    LOCAL_LLM_API_KEY is optional. LOCAL_LLM_TIMEOUT seconds defaults to 180.
+    """
+
+    label = "local"
+
+    def __init__(self, model: Optional[str] = None, base_url: Optional[str] = None):
+        self.base_url = (base_url or os.environ.get("LOCAL_LLM_URL") or "").strip()
+        self.model = (model or os.environ.get("LOCAL_LLM_MODEL") or "").strip()
+
+    def complete_json(self, user_content: str, system: Optional[str] = None) -> dict:
+        """POST /chat/completions and parse one JSON object.
+
+        Sends response_format json_object, then retries once without it when
+        the server rejects that field. Does not call Gemini or Claude.
+        """
+        import requests
+
+        if not self.base_url or not self.model:
+            raise RuntimeError(
+                "LocalBot needs LOCAL_LLM_URL and LOCAL_LLM_MODEL. "
+                "Example: LOCAL_LLM_URL=http://127.0.0.1:11434/v1 LOCAL_LLM_MODEL=llama3.1"
+            )
+        messages = []
+        if system:
+            messages.append({"role": "system", "content": system})
+        messages.append({"role": "user", "content": user_content})
+        body = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": 0.2,
+            "stream": False,
+            "response_format": {"type": "json_object"},
+        }
+        headers = {"Content-Type": "application/json"}
+        key = (os.environ.get("LOCAL_LLM_API_KEY") or "").strip()
+        if key:
+            headers["Authorization"] = f"Bearer {key}"
+        timeout = float(os.environ.get("LOCAL_LLM_TIMEOUT") or 180)
+        url = _chat_completions_url(self.base_url)
+        resp = requests.post(url, headers=headers, json=body, timeout=timeout)
+        if resp.status_code == 400 and "response_format" in body:
+            body.pop("response_format")
+            resp = requests.post(url, headers=headers, json=body, timeout=timeout)
+        if not resp.ok:
+            raise RuntimeError(f"{resp.status_code} from local model: {resp.text[:800]}")
+        data = resp.json()
+        choices = data.get("choices") or []
+        if not choices:
+            raise RuntimeError(f"local model returned no choices: {json.dumps(data)[:800]}")
+        text = ((choices[0].get("message") or {}).get("content")) or ""
+        return _parse_json_text(text, self.label)
+
+
+class FallbackBot(CardBot):
+    """Try the cloud bot. On quota or an outage, send the same prompt to the local bot."""
+
+    def __init__(self, primary: CardBot, fallback: CardBot):
+        self.primary = primary
+        self.fallback = fallback
+        self.label = primary.label
+
+    def complete_json(self, user_content: str, system: Optional[str] = None) -> dict:
+        try:
+            return self.primary.complete_json(user_content, system=system)
+        except Exception as exc:
+            if not _cloud_unavailable(exc):
+                raise
+            print(
+                f"{self.primary.label} unavailable ({str(exc)[:180]}). "
+                f"Sending the same prompt to local model {getattr(self.fallback, 'model', 'local')}."
+            )
+            try:
+                return self.fallback.complete_json(user_content, system=system)
+            except Exception as local_exc:
+                raise RuntimeError(
+                    f"{self.primary.label} unavailable ({exc}); local model failed ({local_exc})"
+                ) from local_exc
+
+
 def make_bot(name: str = "gemini") -> CardBot:
-    """gemini → GeminiBot (default), claude → ClaudeBot."""
+    """gemini → GeminiBot, claude → ClaudeBot, local → LocalBot.
+
+    When LOCAL_LLM_URL and LOCAL_LLM_MODEL are set, gemini and claude fall
+    back to the local server after a quota or availability failure. The same
+    prompt is sent. Voyage is not involved.
+    """
+    if name == "local":
+        return LocalBot()
     if name == "gemini":
-        return GeminiBot()
-    if name == "claude":
-        return ClaudeBot()
-    raise ValueError(f"unknown bot {name!r}. bots: {list(BOTS)}")
+        primary: CardBot = GeminiBot()
+    elif name == "claude":
+        primary = ClaudeBot()
+    else:
+        raise ValueError(f"unknown bot {name!r}. bots: {list(BOTS)}")
+    if local_bot_configured():
+        return FallbackBot(primary, LocalBot())
+    return primary
 
 
 def claude_json(user_content: str, system: Optional[str] = None) -> dict:
@@ -386,7 +645,7 @@ def main() -> None:
     """CLI: ingest --text/--url, or validate --claim. Prints JSON to stdout."""
     p = argparse.ArgumentParser(description="Chat bot for ingest and validation.")
     p.add_argument("action", choices=["ingest", "validate"])
-    p.add_argument("--bot", default="gemini", choices=list(BOTS), help="gemini is the free tier. claude needs ANTHROPIC_API_KEY.")
+    p.add_argument("--bot", default="gemini", choices=list(BOTS), help="gemini is the free tier. claude needs ANTHROPIC_API_KEY. local uses LOCAL_LLM_URL.")
     p.add_argument("--text", default=None, help="Source text for ingest")
     p.add_argument("--url", default=None, help="Source URL for ingest")
     p.add_argument("--claim", default=None, help="Claim to validate")

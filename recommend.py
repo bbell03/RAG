@@ -225,7 +225,18 @@ def reason_gemini(
     return _reason_with("gemini", question, hits, retrieval, threshold, extra)
 
 
-REASONERS = {"gemini": reason_gemini, "none": reason_none, "claude": reason_claude}
+def reason_local(
+    question: str,
+    hits: List[Hit],
+    retrieval: float,
+    threshold: float,
+    extra: Optional[str] = None,
+) -> dict:
+    """Local composer. Needs LOCAL_LLM_URL and LOCAL_LLM_MODEL. Skips the cloud."""
+    return _reason_with("local", question, hits, retrieval, threshold, extra)
+
+
+REASONERS = {"gemini": reason_gemini, "none": reason_none, "claude": reason_claude, "local": reason_local}
 
 
 def cards_from_reasoner(raw_cards: List[dict], question: str) -> List[dict]:
@@ -305,7 +316,7 @@ def recommend(
     report = []
 
     hits = retrieve_fn()
-    if critic is None and reasoner in ("claude", "gemini"):
+    if critic is None and reasoner in ("claude", "gemini", "local"):
         critic = reasoner
     for round_i in range(1, max_rounds + 1):
         if drafted:

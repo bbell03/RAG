@@ -419,7 +419,7 @@ def _print_draft_coverage(cards, args) -> None:
         return query(claim, provider=args.provider, top_k=args.top_k)
 
     try:
-        critic = args.drafter if args.drafter in ("claude", "gemini") else None
+        critic = args.drafter if args.drafter in ("claude", "gemini", "local") else None
         reports = assess_drafts(
             cards,
             retrieve,

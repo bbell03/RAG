@@ -4,12 +4,19 @@ This document describes how to configure and run the **Passive Research State** 
 
 ```mermaid
 flowchart TD
-    Scan["1. Scanner:\nScan cards.jsonl for weak claims\n(confidence < 0.65 or truth == 'insufficient')"] --> Retrieve["2. Voyage Embedding Retrieval:\nFetch nearest-neighbor cards from cards.db"]
-    Retrieve --> WebSearch["3. DuckDuckGo & Web Scraper:\nFetch independent articles & lab citations"]
-    WebSearch --> Critic["4. Truth Critic (validate.py + Gemini):\nScore support, conflict, or insufficient"]
-    Critic --> Rebase["5. Refine & Rebase Metadata:\nUpdate corroboration, confidence, refines, contradicts"]
-    Rebase --> Stage["6. Safe Review Buffer:\nWrite staged results to candidates.jsonl"]
-    Stage --> Commit["7. Human Approval & Indexing:\nReview candidates -> append to cards.jsonl -> build index"]
+    Scan["1. Scanner:\nWeak claims in cards.jsonl"] --> Retrieve["2. Retrieval + web evidence"]
+    Retrieve --> Critic["3. Truth critic:\nsupport, conflict, or insufficient"]
+    Critic --> Controller["4. Claims controller"]
+    Controller --> Validate["validate:\nkeep the sentence, raise confidence"]
+    Controller --> Modify["modify:\nsame id, corrected sentence"]
+    Controller --> Remove["remove:\narchive.jsonl, never hard-delete"]
+    Controller --> Add["add:\nnew claim the evidence states"]
+    Controller --> Propagate["propagate:\nspecialize into a workflow, or expand the mechanism"]
+    Add --> Stage["candidates.jsonl\ndrafts at confidence <= 0.45"]
+    Propagate --> Stage
+    Validate --> Library["cards.jsonl\nthen rebuild cards.db"]
+    Modify --> Library
+    Remove --> Library
 ```
 
 ---
@@ -20,49 +27,73 @@ Autonomous research in knowledge systems can easily lead to model drift, halluci
 
 | Risk | Architecture Guardrail | Implementation |
 | :--- | :--- | :--- |
-| **Hallucination Contamination** | **Staging Isolation** | The script reads `cards.jsonl` as immutable reference, writing exclusively to `candidates.jsonl`. Ground truth is never modified autonomously. |
+| **Hallucination Contamination** | **Draft isolation** | `add` and `propagate` write drafts to `candidates.jsonl` with confidence capped at 0.45. They enter `cards.jsonl` only with `--commit` or an interactive yes. `modify` keeps the same card id and stores the previous sentence on `prior_claim`. |
 | **Runaway API Costs / Loops** | **Bounded Batching & Rate Limiting** | Max claims per run (e.g. 5 claims), max 2 web pages fetched per claim, and explicit 3–5s delays between queries. |
 | **Echo Chambers / Self-Citation** | **Independent Citation Rule** | The critic (`validate.py`) rejects self-referential library claims; it requires external web URLs (`source.reference`) and identifiable mechanisms to assign `support`. |
 | **Vector Space Bloat** | **Semantic Deduplication** | Before storing any refined candidate, Voyage embeddings check cosine similarity against existing cards. Cards with similarity $\ge 0.82$ are flagged as duplicates. |
 
 ---
 
-## 2. The Script: `passive-research.py`
+## 2. Claims controller
 
-The script [`passive-research.py`](file:///Users/brandonbell/Desktop/RAG/passive-research.py) coordinates the scan, retrieval, web search, critic evaluation, and staging/committing.
+[`passive-research.py`](file:///Users/brandonbell/Desktop/RAG/passive-research.py) is the controller. After the critic returns evidence, it proposes one or more of these operations. A planner model (Gemini, or Claude if that is the configured critic) suggests rewrites and learning cards. If that call fails because of quota or an outage and `LOCAL_LLM_URL` plus `LOCAL_LLM_MODEL` are set, the same prompt goes to that local server. If the local call also fails, the controller follows the critic verdict only and does not invent drafts.
 
-### Operating Modes
+| Operation | When | What changes |
+| :--- | :--- | :--- |
+| **validate** | Evidence supports the sentence as written | Same id and claim. Confidence rises to at least 0.75. Status becomes `reviewed`. |
+| **modify** | Evidence corrects the scope or the mechanism | Same id. New sentence, `prior_claim`, and `revised_at`. A conflict that is only narrowed stays a draft so a later run can re-check it. |
+| **remove** | The mechanism is contradicted and a narrower true claim is not available | Card moves to [`archive.jsonl`](file:///Users/brandonbell/Desktop/RAG/archive.jsonl). Without `--interactive`, removal is withheld and the card is demoted instead, so the conflict is recorded and the loop can stop. |
+| **add** | Evidence states a different atomic claim | New draft in `candidates.jsonl`. Confidence capped at 0.45. |
+| **propagate / specialize** | The same mechanism should be usable in a specific style, phase, or workflow | Child draft with `refines: [parent id]`. Workflow targets are `fermentation_lab_dashboard`, `pizza_cart_app`, and `mise_en_place`. |
+| **propagate / expand** | Evidence supports a broader style or an adjacent variable | Child draft with `expands: [parent id]`. |
 
-#### A. Single-Batch Mode (Default)
-Scans up to $N$ weak claims (default 5), attempts web verification, and stages results to [`candidates.jsonl`](file:///Users/brandonbell/Desktop/RAG/candidates.jsonl):
+Specialize drafts that repeat an existing style + phase + workflow for that parent are dropped. So are near-duplicate sentences (normalized text match, or Voyage cosine similarity ≥ 0.82 against a card other than the parent).
+
+### Commands
+
 ```bash
+# Scan up to 5 weak claims. Confirm nothing. Existing-card edits are written
+# to cards.jsonl. New add/propagate drafts stay in candidates.jsonl.
 python passive-research.py --batch-size 5
+
+# Same scan, but confirm every operation:
+python passive-research.py --interactive --batch-size 5
+
+# Keep going until claims are settled or a round finds no corroborated edits.
+python passive-research.py --until-done --max-actions 10
+
+# Research one card, then modify it and fan it out if the evidence supports that.
+python passive-research.py modify --id cold-ferment-openability
+
+# Replace one sentence yourself. The id does not change.
+python passive-research.py modify --id cold-ferment-openability \
+  --claim "Extended cold fermentation relaxes lower-hydration NY dough so it opens with less tearing."
+
+# Add a claim. It is staged at confidence <= 0.45 unless you pass --commit.
+python passive-research.py add \
+  --claim "Protease activity during cold fermentation increases dough extensibility." \
+  --style general --variable fermentation_time,extensibility
+
+# Archive a card.
+python passive-research.py remove --id dough-should-feel-springy-not-wet-before-proofig
+
+# Fan one supported claim into workflow-specific and broader learning drafts.
+python passive-research.py propagate --id clock-vs-degree-hours
+
+# Research without spawning those drafts.
+python passive-research.py --no-propagate
 ```
 
-#### B. Continuous "Until-Done" On Mode (`--until-done`)
-An autonomous "run until finished" mode that loops iteratively across rounds until one of two exit criteria is met:
-1. **Full Verification Success**: **All claims** in [`cards.jsonl`](file:///Users/brandonbell/Desktop/RAG/cards.jsonl) have been evaluated and achieved conclusive support or conflict with confidence $\ge 0.65$.
-2. **Exhaustion Halt**: All remaining unverified claims were searched on the web, and **no further corroborating evidence could be found**.
-
-```bash
-# Run continuously, auto-committing verified cards and rebuilding cards.db after each round:
-python passive-research.py --until-done
-
-# Or run continuously, but stage to candidates.jsonl instead of auto-committing:
-python passive-research.py --until-done --no-commit
-```
+`--commit` also inserts the new drafts into `cards.jsonl` and rebuilds `cards.db`. `--max-actions` (default 10) caps how many operations a session applies. Each claim is researched at most once per session.
 
 ---
 
-## 3. How the "Until-Done" Mode Operates
+## 3. How "Until-Done" Operates
 
-1. **Active Target Identification**: Scans [`cards.jsonl`](file:///Users/brandonbell/Desktop/RAG/cards.jsonl) for claims where `confidence < 0.65`, `status == "draft"`, or `corroboration.verdict in ("insufficient", None)`.
-2. **Dynamic Progress Tracking**:
-   - Supported claims: bumps confidence to $\ge 0.75$, marks `status: "reviewed"`, and attaches citation URLs.
-   - Conflicted claims: sets confidence to $0.20$ and notes contradicting IDs.
-   - Insufficient claims: flagged as *unresolvable for this session* so the loop does not waste API calls querying dead ends repeatedly.
-3. **Continuous Re-indexing**: With `--commit` enabled (default in `--until-done`), each newly substantiated batch is immediately written to [`cards.jsonl`](file:///Users/brandonbell/Desktop/RAG/cards.jsonl) and [`cards.db`](file:///Users/brandonbell/Desktop/RAG/cards.db) is rebuilt. This means subsequent unverified claims benefit from the newly proven claims as vector neighbors!
-4. **Clean Exit**: The loop terminates gracefully and prints an audit report showing either full library coverage or the exact list of claims that could not be evidenced by web search.
+1. **Active targets**: Claims with confidence below 0.65, status `draft`, or corroboration that is missing, `insufficient`, or `skipped`. A claim already marked `support` or `conflict` with status `reviewed` is left alone.
+2. **One pass per claim per session**: Supported claims are validated or rewritten. Contradicted claims are archived only if you confirm; otherwise they are demoted (confidence at most 0.20, status `reviewed`) so the next round does not fetch them again. Insufficient claims are skipped for the rest of the session.
+3. **Re-index when the library changes**: Validated and modified cards are written to [`cards.jsonl`](file:///Users/brandonbell/Desktop/RAG/cards.jsonl) and [`cards.db`](file:///Users/brandonbell/Desktop/RAG/cards.db) is rebuilt, so the next round can use them as neighbors. New drafts stay in `candidates.jsonl` unless `--commit` is set.
+4. **Stop**: The loop stops when nothing is left to research, a round applies no edits, `--max-actions` is hit, or 20 rounds have run. It prints the ids that stayed unsettled.
 
 ---
 
@@ -147,8 +178,10 @@ The system will now pass the `0.70` threshold immediately with strong external c
 
 ## 6. Configuration & Tuning
 
-You can adjust parameters inside [`passive-research.py`](file:///Users/brandonbell/Desktop/RAG/passive-research.py) to suit your workload:
+Flags on [`passive-research.py`](file:///Users/brandonbell/Desktop/RAG/passive-research.py):
 
-* **Batch Size (`max_claims`)**: Adjust how many claims are processed in a single run (default `5`). Keep this between 3–10 to respect free-tier rate limits.
-* **Confidence Floor (`< 0.65`)**: Raise or lower the bar for which cards qualify as needing research.
-* **Rate Limiting (`time.sleep(3)`)**: Adjust delay between DuckDuckGo searches and Gemini API calls to prevent 429/503 rate limit spikes.
+* **`--batch-size`**: Weak claims researched per round (default `5`). Keep this between 3 and 10 on the free tier.
+* **`--max-actions`**: Applied operations per session (default `10`), counting each validate, modify, add, remove, and propagate.
+* **`--confidence-bar`**: Claims at or above this, already reviewed as support or conflict, are skipped (default `0.65`).
+* **`--delay`**: Seconds between web lookups (default `3`).
+* **`--no-propagate`**: Research and modify claims without spawning workflow drafts.

@@ -306,7 +306,14 @@ def draft_gemini(doc: dict, schema: Optional[dict] = None) -> List[dict]:
     return make_bot("gemini").ingest(doc, schema)
 
 
-DRAFTERS = {"gemini": draft_gemini, "template": draft_template, "claude": draft_claude}
+def draft_local(doc: dict, schema: Optional[dict] = None) -> List[dict]:
+    """Local author path. Needs LOCAL_LLM_URL and LOCAL_LLM_MODEL."""
+    from synthesis import make_bot
+
+    return make_bot("local").ingest(doc, schema)
+
+
+DRAFTERS = {"gemini": draft_gemini, "template": draft_template, "claude": draft_claude, "local": draft_local}
 
 
 def ingest(
