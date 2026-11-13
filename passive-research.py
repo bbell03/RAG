@@ -158,14 +158,13 @@ class ClaimLifecyclePolicy:
             )
         )
 
-    def should_create_claim(self, card: Optional[dict], truth: Optional[dict], duplicate_fn: Optional[Callable[[str], bool]] = None) -> bool:
-        """True when a new card is eligible for creation as a draft.
-
-        Safety gates:
-          - verdict must support enough evidence to justify a draft
-          - novel sentence (deduped against existing cards)
-          - must have a meaningful scope or target, not a vague restatement
-        """
+    def should_create_claim(
+        self,
+        card: Optional[dict],
+        truth: Optional[dict],
+        duplicate_fn: Optional[Callable[[str], bool]] = None,
+    ) -> bool:
+        """True when a new card is eligible for creation as a draft."""
         if not card:
             return False
         verdict = (truth or {}).get("verdict")
@@ -183,7 +182,12 @@ class ClaimLifecyclePolicy:
             return False
         return True
 
-    def should_modify_claim(self, card: Optional[dict], truth: Optional[dict], revised_claim: Optional[str] = None) -> bool:
+    def should_modify_claim(
+        self,
+        card: Optional[dict],
+        truth: Optional[dict],
+        revised_claim: Optional[str] = None,
+    ) -> bool:
         """True when the existing claim should be rewritten, not revalidated."""
         if not card:
             return False
@@ -196,12 +200,13 @@ class ClaimLifecyclePolicy:
             return False
         return True
 
-    def should_archive_claim(self, card: Optional[dict], truth: Optional[dict], repairable: bool = False) -> bool:
-        """True when a contradiction is strong enough to archive the claim.
-
-        Conflict alone is not enough; it must remain unresolved and not repairable
-        by narrowing the claim.
-        """
+    def should_archive_claim(
+        self,
+        card: Optional[dict],
+        truth: Optional[dict],
+        repairable: bool = False,
+    ) -> bool:
+        """True when a contradiction is strong enough to archive the claim."""
         if not card:
             return False
         verdict = (truth or {}).get("verdict")
@@ -214,13 +219,13 @@ class ClaimLifecyclePolicy:
             return False
         return True
 
-    def should_propagate_claim(self, parent: Optional[dict], child: Optional[dict], direction: str) -> bool:
-        """True when a child draft is meaningfully different and worth branching.
-
-        This is intentionally stricter than "direction is present". A child must
-        change scope or generality in a way that helps the learning system become
-        more useful, not just restate the same claim under a different label.
-        """
+    def should_propagate_claim(
+        self,
+        parent: Optional[dict],
+        child: Optional[dict],
+        direction: str,
+    ) -> bool:
+        """True when a child draft is meaningfully different and worth branching."""
         if not parent or not child:
             return False
         direction = str(direction or "").lower()
@@ -272,6 +277,165 @@ def lifecycle_phase_note(phase: str) -> str:
     purpose = info.get("purpose") or "unnamed phase"
     tooling = info.get("tooling") or "generic tooling"
     return f"{phase}: {purpose} | tooling={tooling}"
+
+
+def phase_debug_entry(phase: str, status: str, **details) -> dict:
+    """Structured, machine-readable trace of a research lifecycle phase."""
+    entry = {"phase": phase, "status": status}
+    entry.update(details)
+    return entry
+
+
+class ClaimOp:
+    """One controller decision. card is set for every op except a bare remove."""
+
+    def __init__(
+        self,
+        op: str,
+        reason: str,
+        card: Optional[dict] = None,
+        card_id: Optional[str] = None,
+        parent_id: Optional[str] = None,
+        direction: Optional[str] = None,
+        fallback_card: Optional[dict] = None,
+    ):
+        self.op = op
+        self.reason = reason
+        self.card = card
+        self.card_id = card_id or (card or {}).get("id")
+        self.parent_id = parent_id
+        self.direction = direction
+        self.fallback_card = fallback_card
+
+
+# ===========================================================================
+# Research lifecycle use cases (explicit and debuggable)
+# ===========================================================================
+
+
+def select_work(
+    library: List[dict],
+    unresolved: Optional[Set[str]] = None,
+    confidence_bar: float = 0.65,
+    only_id: Optional[str] = None,
+) -> List[dict]:
+    """Select the claim(s) due for the next research pass.
+
+    This makes the selection policy explicit rather than burying it inside the
+    session loop. It also gives us a single place to debug or audit what the
+    system decides to work on next.
+    """
+    unresolved = unresolved or set()
+    library = library or []
+    if only_id:
+        needy = [card for card in library if card.get("id") == only_id]
+        if not needy:
+            return []
+        return needy
+    return [
+        card
+        for card in library
+        if card.get("id") not in unresolved and is_needing_substantiation(card, confidence_bar)
+    ]
+
+
+def assess_truth(card: dict, use_web: bool = True) -> tuple:
+    """Explicit wrapper for the claims assessment phase.
+
+    Returns (verdict, summary, truth) and keeps the truth-check stage separate
+    from selection and operation synthesis.
+    """
+    return research_claim(card, use_web=use_web)
+
+
+def synthesize_actions(
+    controller: "ClaimsController",
+    card: dict,
+    truth: dict,
+    propagate_unproven: bool = False,
+    check_similarity: bool = True,
+) -> List[ClaimOp]:
+    """Explicit synthesis phase: evidence -> proposed operations."""
+    return controller.propose(
+        card,
+        truth,
+        propagate_unproven=propagate_unproven,
+        check_similarity=check_similarity,
+    )
+
+
+def enforce_policy(
+    policy: ClaimLifecyclePolicy,
+    card: dict,
+    truth: dict,
+    plan: dict,
+    library: List[dict],
+    taken: List[str],
+    allow_propagate: bool = True,
+    propagate_unproven: bool = False,
+    duplicate_fn: Optional[Callable[[str], bool]] = None,
+) -> List[ClaimOp]:
+    """Apply the explicit claim lifecycle policy before a proposal is accepted."""
+    if not policy.phase_gate("enforce_policy", card, truth):
+        return []
+    return ops_from_plan(
+        card,
+        truth,
+        plan,
+        library,
+        taken,
+        allow_propagate=allow_propagate,
+        propagate_unproven=propagate_unproven,
+        duplicate_fn=duplicate_fn,
+    )
+
+
+def verify_proposals(
+    policy: ClaimLifecyclePolicy,
+    card: Optional[dict],
+    ops: List[ClaimOp],
+) -> List[ClaimOp]:
+    """Filter malformed or low-quality proposals before any write phase.
+
+    This is intentionally conservative: if a proposal cannot be justified by the
+    lifecycle policy, it is withheld even if the model proposed it.
+    """
+    valid: List[ClaimOp] = []
+    for op in ops:
+        if op.op == "validate":
+            valid.append(op)
+            continue
+        if op.op == "modify":
+            if policy.should_modify_claim(op.card, op.card.get("corroboration"), op.card.get("claim")):
+                valid.append(op)
+            continue
+        if op.op == "remove":
+            valid.append(op)
+            continue
+        if op.op == "add":
+            if policy.should_create_claim(op.card, {"verdict": "support", "score": float(op.card.get("confidence") or 0.0)}, duplicate_fn=None):
+                valid.append(op)
+            continue
+        if op.op == "propagate":
+            if policy.should_propagate_claim(card, op.card, op.direction or "specialize"):
+                valid.append(op)
+            continue
+    return valid
+
+
+def commit_phase(
+    accepted_round: List[ClaimOp],
+    auto_commit: bool,
+    interactive: bool,
+    force_commit_drafts: bool = False,
+) -> Dict[str, int]:
+    """Explicit commit phase. Puts the write path in one place for easier testing."""
+    return apply_ops(
+        accepted_round,
+        auto_commit=auto_commit,
+        interactive=interactive,
+        force_commit_drafts=force_commit_drafts,
+    )
 
 
 # ===========================================================================
