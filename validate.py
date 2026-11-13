@@ -51,7 +51,7 @@ def _ddg_urls(query: str, limit: int = 3) -> List[str]:
     resp = requests.post(
         "https://html.duckduckgo.com/html/",
         data={"q": query},
-        headers={"User-Agent": "dough-research-validate/0.1"},
+        headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"},
         timeout=20,
         stream=True,
     )
@@ -68,8 +68,15 @@ def _ddg_urls(query: str, limit: int = 3) -> List[str]:
     finally:
         resp.close()
     found = []
-    for encoded in re.findall(r"uddg=([^&\"]+)", html):
-        url = unquote(encoded)
+    # Try uddg redirect encoding
+    candidates = [unquote(m) for m in re.findall(r"uddg=([^&\"]+)", html)]
+    # Also parse direct result hrefs (DDG HTML modern format)
+    if not candidates:
+        candidates = re.findall(
+            r'<a[^>]+class=[\"\'][^\"\']*(?:result__url|result__snippet)[^\"\']*[\"\'][^>]*href=[\"\']([^\"\']+)[\"\']',
+            html,
+        )
+    for url in candidates:
         if not is_url(url) or url in found:
             continue
         host = urlparse(url).netloc.lower()
@@ -82,9 +89,11 @@ def _ddg_urls(query: str, limit: int = 3) -> List[str]:
 
 
 def _fetch_pages(urls: List[str]) -> List[dict]:
-    """Fetch at most MAX_PAGES urls. Failed pages stay in the list with error set."""
+    """Fetch up to MAX_PAGES successful pages, skipping blocked/failed pages."""
     pages = []
-    for url in urls[:MAX_PAGES]:
+    for url in urls:
+        if len([p for p in pages if not p.get("error")]) >= MAX_PAGES:
+            break
         try:
             doc = scrape_url(url)
         except (OSError, ValueError, RuntimeError) as exc:

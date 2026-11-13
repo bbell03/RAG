@@ -1,256 +1,97 @@
 # Dough Research — Insight Card Pipeline
 
-This repository implements a small, modular retrieval-and-verification system for dough-research knowledge. It uses:
-
-- Voyage for embeddings and semantic retrieval
-- SQLite for a local vector-style card index
-- Gemini Flash (free tier) or Claude for drafting, validation, and recommendation synthesis
-- JSONL card records as the source-of-truth knowledge library
+A modular retrieval-and-verification system for pizza dough research. It captures knowledge as atomic, schema-validated "insight cards," embeds them into a local SQLite vector store using Voyage AI, and uses Gemini Flash (or Claude) for automated source ingestion, claim verification, and recommendation synthesis.
 
-The core idea is to store research knowledge as atomic, schema-validated "insight cards" and then:
+```mermaid
+flowchart LR
+    Source["Source Text / URL / File"] --> Ingest["ingest.py\n(Scrape & Draft)"]
+    Ingest --> Candidates["candidates.jsonl\n(Review)"]
+    Candidates -- Commit --> Cards["cards.jsonl\n(Source of Truth)"]
+    Cards --> Build["embed_pipeline.py build\n(Voyage Embeddings)"]
+    Build --> DB[("cards.db\n(Vector Index)")]
+    DB --> Query["Semantic Retrieval\n(embed_pipeline.py query)"]
+    Query --> Reason["recommend.py + validate.py\n(Truth Check & Synthesis)"]
+    Reason --> Output["Recommendation /\nDiagnostic Gaps"]
+```
 
-1. create or ingest a card
-2. embed it into a retrieval index
-3. ask a question or make a claim
-4. retrieve related cards
-5. verify whether the claim is supported, contradicted, or insufficiently evidenced
-6. optionally feed the result to an LLM for a recommendation or action
+---
 
-This is intentionally modular: the storage layer, embedding provider, scrapers, drafters, and reasoners all have explicit extension points.
-
-## Repository at a glance
-
-- `schema.json` — the canonical card schema
-- `cards.jsonl` — the curated knowledge library in JSONL form
-- `cards.db` — generated local SQLite index created by `embed_pipeline.py`
-- `ingest.py` — scraping and drafting logic for new cards
-- `embed_pipeline.py` — indexing, retrieval, add/ingest/recommend commands
-- `recommend.py` — retrieval scoring and recommendation loop
-- `validate.py` — evidence compilation and claim verification
-- `synthesis.py` — Claude-based ingest/validation/recommendation logic
-- `VOYAGE.md` — Voyage-focused behavior and score expectations
+## Quick Start
 
-## What the app models
+### 1. Install Dependencies
 
-Each "insight card" represents one atomic claim about dough behavior, not a sprawling note. Cards are meant to be small, checkable, and relevant to a particular product surface or phase of the workflow.
+Requires Python 3.9+:
 
-Example fields from `schema.json`:
+```bash
+pip install requests numpy
+```
 
-- `id`: stable slug like `windowpane-test-gluten-check`
-- `claim`: one factual sentence
-- `variables`: what the claim concerns (`hydration`, `temperature`, `fermentation_time`, etc.)
-- `style_scope`: applicable dough style (`neapolitan`, `ny_slice`, `general`, etc.)
-- `relevance_targets`: where the card is relevant (`fermentation_lab_dashboard`, `pizza_cart_app`, `mise_en_place`)
-- `confidence`: confidence score between 0 and 1
-- `phase`: workflow phase such as `proofing`, `baking`, `diagnostic`
-- `source`: article, book, web page, conversation, or experiment reference
-- `corroboration`: validation result from Claude after checking evidence
+### 2. Configure API Keys
 
-## Architecture
+Copy the example environment file and add your keys:
 
-The project follows a simple pipeline:
-
-1. Source material
-   - text pasted in manually
-   - a URL scraped from the web
-   - a local file
-   - a typed claim in the terminal
+```bash
+cp .env.example .env
+```
 
-2. Card drafting
-   - `ingest.py` scrapes source content and normalizes it
-   - `synthesis.py` can use Claude to generate candidate cards
-   - `card_from_claim()` shapes a manually authored card into schema form
+Edit [`.env`](file:///Users/brandonbell/Desktop/RAG/.env):
 
-3. Storage and indexing
-   - `cards.jsonl` stores the human-reviewed library
-   - `embed_pipeline.py build` embeds those claims with Voyage and writes them to `cards.db`
+```env
+# Voyage (voyage-4 embeddings): https://dash.voyageai.com
+VOYAGE_API_KEY=your_voyage_key_here
 
-4. Retrieval
-   - `embed_pipeline.py query` or `recommend` searches the library by semantic similarity
-   - structured filters can restrict by style, variable, or target
+# Gemini (drafting & truth checks): https://aistudio.google.com/apikey
+GEMINI_API_KEY=your_gemini_key_here
 
-5. Verification
-   - `validate.py` gathers nearby cards and source URLs
-   - Claude assesses whether a claim is supported, contradicted, or insufficiently evidenced
+# Recommended for free-tier stability (bypasses gemini-3.8-flash traffic spikes):
+GEMINI_MODEL=gemini-3.5-flash
 
-6. Recommendation / LLM usage
-   - `recommend.py` decides whether the library is strong enough to answer the question
-   - if not, it can draft additional cards and continue the loop
-   - the final answer is a recommendation or a status such as "needs more evidence"
+# Optional: only if using --reasoner claude or --drafter claude
+# ANTHROPIC_API_KEY=your_anthropic_key_here
+```
 
-## File-by-file summary and specification
+### 3. Build & Query the Index
 
-### `schema.json`
+```bash
+# Embed existing cards from cards.jsonl into cards.db
+python embed_pipeline.py build --provider voyage
 
-Purpose: canonical card schema for all cards.
+# Semantic query for relevant cards
+python embed_pipeline.py query --provider voyage --text "how do I know if Neapolitan dough is over-proofed"
 
-What it defines:
-- required fields for a valid card
-- allowed enums and preferred vocabularies
-- optional metadata such as `source`, `phase`, `kind`, `status`, `corroboration`, and `relevance_targets`
+# Run full recommendation with truth validation
+python embed_pipeline.py recommend --provider voyage --reasoner gemini \
+  --text "is this Neapolitan dough ready to bake" --threshold 0.7
+```
 
-Why it matters:
-- keeps all cards structurally consistent
-- enables schema validation and downstream filtering
-- provides the contract used by ingestion, drafting, and retrieval
+---
 
-Key schema rules:
-- `id` is required and should be a stable slug
-- `claim` is required and should be a single, falsifiable fact
-- `variables`, `style_scope`, and `relevance_targets` are arrays of normalized slugs
-- `confidence` is numeric between 0 and 1
-- `corroboration` is a separate validation object produced after check/verify steps
+## Core Workflows
 
-### `cards.jsonl`
+### 1. Ingesting External Sources into Cards
 
-Purpose: the primary card library in a line-delimited JSON format.
+Scrape an article, text snippet, or local document and use Gemini to draft atomic candidate cards:
 
-What it contains:
-- one JSON object per line
-- each object matches `schema.json`
-- a human-curated or reviewed set of cards
+```bash
+# From a web URL:
+python embed_pipeline.py ingest --url "https://www.seriouseats.com/pizza-protips-is-it-ready"
 
-Why it matters:
-- source-of-truth for the research library
-- readable and easily appendable
-- used by `embed_pipeline.py` to build the vector index
+# From a local text/html file:
+python embed_pipeline.py ingest --file notes.txt
 
-Notes:
-- this file is not binary and is intended for version control
-- a card is typically added by `embed_pipeline.py add` or by appending a valid JSON line manually
-- after adding a card, rebuild the embedded index with `python embed_pipeline.py build --provider voyage`
+# From raw text pasted in terminal:
+python embed_pipeline.py ingest --text "Cold fermentation for 48 hours improves extensibility..."
 
-### `cards.db`
+# Auto-commit drafts directly to cards.jsonl (bypassing candidates.jsonl):
+python embed_pipeline.py ingest --url "https://example.com/dough-tips" --commit
+```
 
-Purpose: generated SQLite database containing the embedded cards used for retrieval.
+> [!NOTE]
+> By default, drafted cards are written to `candidates.jsonl` for human review. Once reviewed, commit them with `--commit` or append them to [`cards.jsonl`](file:///Users/brandonbell/Desktop/RAG/cards.jsonl), then re-run `python embed_pipeline.py build --provider voyage`.
 
-What it is:
-- built from the cards in `cards.jsonl`
-- stores the serialized embedding blobs for each card
-- used for fast approximate retrieval and filtering
+### 2. Manually Adding a Claim
 
-Notes:
-- generated runtime artifact, not usually hand-edited
-- should be rebuilt after changes to the knowledge base
-
-### `ingest.py`
-
-Purpose: ingest external information into the repo, normalize it, and draft candidate cards.
-
-What it includes:
-- `load_schema()` and `schema_enums()` to read and normalize schema constraints
-- `scrape_url()`, `scrape_file()`, and `scrape_text()` for ingest sources
-- `normalize_card()` to convert raw drafts into validated card records
-- `draft_gemini()` (default), `draft_template()`, and `draft_claude()` to generate candidate cards from raw text
-- `commit_candidates()` to append new cards to `cards.jsonl`
-
-Key behaviors:
-- scrapers return a document payload with `source_type`, `reference`, and `text`
-- only valid cards are retained
-- card IDs are generated with uniqueness checks to avoid collisions
-- `cards.jsonl` is not modified until you explicitly commit a draft
-
-This module is the place to plug in new sources or draft strategies.
-
-### `embed_pipeline.py`
-
-Purpose: the main runtime interface for building, querying, adding, ingesting, and recommending against the card library.
-
-What it includes:
-- embedding provider abstraction for Voyage (extendable to other providers)
-- SQLite setup and storage logic
-- `build_index()` for embedding the full library
-- `query()` for semantic search with optional structured filters
-- `resolve_query()` for inferring style/target/variable from text or a card
-- CLI actions: `build`, `query`, `ingest`, `add`, `recommend`
-
-Key behaviors:
-- Voyage is used for producing embeddings
-- retrieval is cosine similarity over the embedded claim text
-- filters can be applied by `style`, `variable`, or `relevance_target`
-- a library recommendation can include a Claude reasoner and truth validation stage
-
-Important usage contract:
-- build and query must use the same embedding provider
-- after new cards are committed to `cards.jsonl`, re-run `build` before querying with the new content
-
-### `recommend.py`
-
-Purpose: determine whether the library already knows enough to answer a user question.
-
-What it includes:
-- `knowledge_score()` for assessing retrieval confidence
-- `classify_coverage()` to label the gap state (`duplicate`, `covered`, `refines`, `gap`)
-- `assess_drafts()` to evaluate candidate cards against existing neighbors
-- `recommend()` to execute a retrieval → score → optional draft loop
-- `REASONERS` with `none`, `gemini`, and `claude` options
-
-Behavior:
-- initial retrieval is based on embeddings
-- a reasoner may decide if the library is sufficient or if more cards should be drafted
-- optional Gemini or Claude synthesize step may propose missing knowledge cards
-- this loop caps itself with `max_rounds` and guards against excessive recursion
-
-### `validate.py`
-
-Purpose: the truth-checking layer for claims.
-
-What it includes:
-- `is_url()` to guard URL validation
-- `_ddg_urls()` to gather candidate search results
-- `gather_evidence()` to collect nearby library cards and web pages
-- `evaluate_truth()` to ask Gemini or Claude to judge a claim as support/conflict/insufficient
-- `apply_truth()` to blend library coverage with evidence truth into a final score
-
-Behavior:
-- if neither `GEMINI_API_KEY` nor `ANTHROPIC_API_KEY` is set, truth checks are skipped, not crashed
-- if web fetches fail, the system still returns a degraded verdict instead of failing completely
-- this module answers: "is this claim actually supported by evidence?"
-
-### `synthesis.py`
-
-Purpose: the generative LLM layer that writes or critiques cards.
-
-What it includes:
-- `CardBot` prompts shared by both clients: ingest, validate, synthesize, reason
-- `GeminiBot` for the free Gemini Flash API (`GEMINI_API_KEY`)
-- `ClaudeBot` for the Anthropic Messages API (`ANTHROPIC_API_KEY`)
-
-Behavior:
-- all responses are structured as JSON
-- this is the only module that speaks to Gemini or Anthropic directly
-- it is intentionally separated from retrieval logic so you can swap out the model or call another provider later
-
-### `VOYAGE.md`
-
-Purpose: details for operating the embedding layer.
-
-What it documents:
-- how Voyage is used in this repo
-- what `query`, `add`, and `recommend` do
-- score behavior and expected similarity semantics
-- when to use each API mode
-
-This is a valuable companion file when debugging retrieval issues or tuning thresholds.
-
-### `README.md`
-
-Purpose: project guide and operational reference.
-
-This file should explain:
-- what the repo does
-- how data flows end-to-end
-- how to start from a claim or URL
-- how to add cards and rebuild the index
-- how to verify a claim and feed it into the LLM/recommendation path
-
-## Moduled use cases
-
-### 1. Create a card
-
-Use when a source fact is known and should become a structured library entry.
-
-Command:
+Add a single structured card directly to the library:
 
 ```bash
 python embed_pipeline.py add \
@@ -260,172 +101,94 @@ python embed_pipeline.py add \
   --variable tactility
 ```
 
-This does the following:
-- creates a schema-shaped card from the claim
-- infers or overrides style/target/variable tags
-- checks whether the claim is already covered by nearby library cards
-- writes the card to `cards.jsonl` and returns a normalized JSON object
+### 3. Semantic Retrieval & Filtering
 
-After committing the card, rebuild the index:
+Search cards with optional structured metadata filters:
 
 ```bash
-python embed_pipeline.py build --provider voyage
+python embed_pipeline.py query --provider voyage \
+  --text "windowpane gluten development" \
+  --style neapolitan \
+  --target fermentation_lab_dashboard \
+  --top-k 5
 ```
 
-### 2. Make a claim and verify it
+### 4. Recommendation Loop & Knowledge Gaps
 
-Use when you have a candidate fact and want to know if it is supported or contradicted by the library and/or web evidence.
-
-Example:
-
-```bash
-python embed_pipeline.py recommend --provider voyage --reasoner gemini \
-  --text "is this Neapolitan dough ready to bake" \
-  --threshold 0.7 --commit
-```
-
-This sequence:
-- retrieves nearby cards by semantic similarity
-- evaluates the local library coverage
-- optionally asks Claude to synthesize missing cards
-- verifies the claim using evidence pages and/or web search
-- returns a recommendation if the library and evidence are strong enough
-
-### 3. Verify a claim without a full recommendation
-
-If you want a direct verification pass on a claim:
-
-```bash
-python synthesis.py validate --claim "Cold fermentation improves extensibility without making the dough slack." --no-web
-```
-
-This runs `evaluate_truth()` logic behind the scenes and returns a structured decision like:
-- `support`
-- `conflict`
-- `insufficient`
-
-### 4. Feed a claim to the LLM
-
-The repo separates retrieval from generation.
-
-Typical pattern:
-
-1. Retrieve relevant nearby cards using `embed_pipeline.py query`
-2. Build a question or claim
-3. Call `recommend` with `--reasoner gemini`
-4. Let Claude decide whether the library is ready and whether to draft missing cards
-
-Example:
+Evaluates whether the current card library has sufficient evidence to answer a question or make a operational recommendation. If evidence is lacking, the reasoner drafts targeted gap-filling cards:
 
 ```bash
 python embed_pipeline.py recommend --provider voyage --reasoner gemini \
   --text "How can I tell if a Neapolitan dough has over-proofed?" \
-  --threshold 0.7
-```
-
-The output includes:
-- retrieval score
-- knowledge score
-- rounds of coverage assessment
-- any drafted cards
-- final recommendation if the threshold is met
-
-## Quick start
-
-Install the Python dependencies you need:
-
-```bash
-pip install requests numpy
-```
-
-Set required environment variables:
-
-```bash
-export VOYAGE_API_KEY=...
-export GEMINI_API_KEY=...      # free key from https://aistudio.google.com/apikey
-# export ANTHROPIC_API_KEY=... # only if you use --reasoner claude / --drafter claude
-```
-
-Build the initial index:
-
-```bash
-python embed_pipeline.py build --provider voyage
-```
-
-Query similar cards:
-
-```bash
-python embed_pipeline.py query --provider voyage \
-  --text "how do I know if Neapolitan dough is over-proofed" \
-  --style neapolitan \
-  --target fermentation_lab_dashboard
-```
-
-Add a card:
-
-```bash
-python embed_pipeline.py add --provider voyage \
-  --claim "For Neapolitan dough, poke-test spring-back beats clock time."
-```
-
-Recommend or validate a claim:
-
-```bash
-python embed_pipeline.py recommend --provider voyage --reasoner gemini \
-  --text "is this Neapolitan dough ready to bake" \
   --threshold 0.7 --commit
 ```
 
-## Sanity checks and operational guidance
+- If `knowledge_score >= threshold`: outputs a synthesized recommendation.
+- If `knowledge_score < threshold`: lists identified gaps and drafts candidate cards.
 
-- `cards.jsonl` is the source-of-truth; `cards.db` is derived
-- after editing `cards.jsonl`, always rebuild the index
-- Voyage handles embeddings and retrieval only; Gemini (or Claude) handles drafting and truth evaluation
-- claim verification depends on evidence, not just nearest neighbors
-- if neither `GEMINI_API_KEY` nor `ANTHROPIC_API_KEY` is set, the truth step is skipped rather than crashing
-- use `--no-web` or `--no-truth` when you want to simplify or isolate retrieval behavior
+### 5. Standalone Truth Verification
 
-## Recommended mental model
-
-The most important distinction is:
-
-- retrieval answers: "Do we already know something similar?"
-- verification answers: "Is this claim actually supported?"
-- recommendation answers: "Given the library and evidence, should we act or ask for more info?"
-
-This repo keeps those stages separate so it can be extended, debugged, and re-used in a larger app without mixing retrieval logic and LLM decision logic together.
-
-## When to extend the repo
-
-The code is already organized around extension points:
-
-- add new scraper functions in `ingest.py`
-- add a new embedding provider in `embed_pipeline.py`
-- add a new reasoner in `recommend.py`
-- add a new verification strategy in `validate.py`
-- add a new generative skill in `synthesis.py`
-
-This keeps the app modular and lets you adapt it to new domains or product workflows beyond pizza dough research.
-
-## Minimal practical workflow
-
-For many day-to-day uses, this is the simplest sequence:
+Validate whether a specific claim is supported, contradicted, or insufficiently evidenced by web sources and existing cards:
 
 ```bash
-# 1) write a claim or ingest a source
-python embed_pipeline.py add --claim "Dough should feel springy, not wet, before proofing ends."
-
-# 2) build the vector index
-python embed_pipeline.py build --provider voyage
-
-# 3) run a recommendation / check
-python embed_pipeline.py recommend --provider voyage --reasoner gemini \
-  --text "when should I stop proofing Neapolitan dough?" \
-  --threshold 0.7
+python synthesis.py validate --claim "Cold fermentation increases dough extensibility."
 ```
-
-This keeps the knowledge base small, reviewable, and semantically queryable while still leaving room for validation and LLM-assisted reasoning.
 
 ---
 
-If you want, I can also rewrite this into a shorter, more polished GitHub README style with a cleaner landing-page summary and a smaller command reference section, or I can help refine the actual README in-place for your repo.
+## Data Model & Schema
+
+Each insight card represents **one atomic, falsifiable claim** about dough behavior. The canonical contract is defined in [`schema.json`](file:///Users/brandonbell/Desktop/RAG/schema.json).
+
+| Field | Type | Description | Example |
+| :--- | :--- | :--- | :--- |
+| `id` | string (slug) | Unique, stable identifier | `windowpane-test-gluten-check` |
+| `claim` | string | Single factual assertion | `"Poke-test spring-back indicates dough readiness."` |
+| `variables` | string[] | Controlled or observed parameters | `["fermentation_time", "temperature", "tactility"]` |
+| `style_scope` | string[] | Applicable dough styles | `["neapolitan", "ny_slice", "general"]` |
+| `relevance_targets` | string[] | Workflow surface / application | `["fermentation_lab_dashboard", "pizza_cart_app"]` |
+| `phase` | string / string[] | Workflow stage | `bulk_fermentation`, `proofing`, `baking` |
+| `confidence` | float (0–1) | Confidence score | `0.75` |
+| `source` | object | Attribution metadata | `{"type": "article", "reference": "https://..."}` |
+| `corroboration` | object | Truth validation result | `{"verdict": "support", "score": 0.85, ...}` |
+
+---
+
+## Repository Map
+
+| File | Role & Extension Point |
+| :--- | :--- |
+| [`cards.jsonl`](file:///Users/brandonbell/Desktop/RAG/cards.jsonl) | **Source of truth**: Hand-curated knowledge base of schema-valid cards. |
+| [`cards.db`](file:///Users/brandonbell/Desktop/RAG/cards.db) | **Generated index**: Local SQLite database storing Voyage float vector blobs. |
+| [`schema.json`](file:///Users/brandonbell/Desktop/RAG/schema.json) | **Contract**: Schema rules, enums, and required fields. |
+| [`embed_pipeline.py`](file:///Users/brandonbell/Desktop/RAG/embed_pipeline.py) | **CLI Dispatcher & Vector Store**: CLI entry point for `build`, `query`, `ingest`, `add`, and `recommend`. |
+| [`ingest.py`](file:///Users/brandonbell/Desktop/RAG/ingest.py) | **Scraper & Drafter**: Scrapes web/files/text and shapes text into normalized cards. |
+| [`recommend.py`](file:///Users/brandonbell/Desktop/RAG/recommend.py) | **Scoring & Loop**: Calculates retrieval scores, detects knowledge gaps, and manages iteration rounds. |
+| [`validate.py`](file:///Users/brandonbell/Desktop/RAG/validate.py) | **Truth Critic**: Gathers evidence from nearby cards and DuckDuckGo web search to evaluate claim validity. |
+| [`synthesis.py`](file:///Users/brandonbell/Desktop/RAG/synthesis.py) | **Generative LLM Bridge**: Interacts with Gemini (`GeminiBot`) and Anthropic (`ClaudeBot`). Implements retries and JSON parsers. |
+| [`VOYAGE.md`](file:///Users/brandonbell/Desktop/RAG/VOYAGE.md) | **Embedding Reference**: Details on `voyage-4` scoring behavior, similarity thresholds, and indexing contracts. |
+| [`passive-research.md`](file:///Users/brandonbell/Desktop/RAG/passive-research.md) | **Autonomous Research Guide**: Operating the safe, bounded background research loop with [`passive-research.py`](file:///Users/brandonbell/Desktop/RAG/passive-research.py). |
+
+---
+
+## Operational Details & Resilience
+
+### Gemini Model Selection & Free Tier
+
+- Default model in code: `gemini-3.8-flash`.
+- **Recommended in** [`.env`](file:///Users/brandonbell/Desktop/RAG/.env): `GEMINI_MODEL=gemini-3.5-flash`.
+- *Why:* Google AI Studio free tier periodically experiences high-demand spikes on `gemini-3.8-flash` (returning `503 UNAVAILABLE` or stalling connections). Setting `gemini-3.5-flash` provides stable, low-latency responses.
+
+### Automatic Retries & Backoff
+
+- Calls to Gemini in [`synthesis.py`](file:///Users/brandonbell/Desktop/RAG/synthesis.py) include automatic exponential backoff retry logic (up to 4 attempts) handling transient `503`, `429` (rate limits), and connection/read timeouts.
+
+### Offline & Web Modes
+
+- By default, `recommend` and `validate` use DuckDuckGo to search the web for corroborating citations.
+- Use `--no-web` to restrict validation to local card library evidence only.
+- Use `--no-truth` to skip LLM truth verification and evaluate pure library similarity coverage.
+
+### macOS Python Warning Suppression
+
+- On macOS system Python 3.9, `urllib3 v2` can log `NotOpenSSLWarning` due to Apple's built-in LibreSSL. This warning is filtered out automatically by `embed_pipeline.py` and `synthesis.py`.

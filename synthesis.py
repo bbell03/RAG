@@ -23,7 +23,37 @@ source is sliced to MAX_DRAFT_CHARS before the prompt.
 import argparse
 import json
 import os
+import time
+import warnings
 from typing import List, Optional
+
+warnings.filterwarnings("ignore", message=".*urllib3 v2 only supports OpenSSL.*")
+warnings.filterwarnings("ignore", message=".*compiled with 'LibreSSL.*")
+
+
+def load_env(path: Optional[str] = None) -> None:
+    """Load KEY=VALUE lines from the project .env. Existing shell vars win.
+
+    The scripts read VOYAGE_API_KEY and GEMINI_API_KEY from the environment.
+    A .env file is optional so a local terminal can keep the keys out of git.
+    Empty values are ignored. Does not override a variable already set.
+    """
+    env_path = path or os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    if not os.path.isfile(env_path):
+        return
+    with open(env_path) as handle:
+        for raw in handle:
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key and value and key not in os.environ:
+                os.environ[key] = value
+
+
+load_env()
 
 CLAUDE_MODEL = "claude-sonnet-4-6"
 CLAUDE_URL = "https://api.anthropic.com/v1/messages"
@@ -282,7 +312,7 @@ class GeminiBot(CardBot):
         """POST generateContent and parse a JSON object.
 
         Thinking is pinned to low so the token budget is left for the JSON.
-        Temperature is omitted: Gemini 3.6+ ignores it. Does not retry.
+        Temperature is omitted: Gemini 3.6+ ignores it. Retries on 429/503/timeout.
         """
         import requests
 
@@ -300,24 +330,42 @@ class GeminiBot(CardBot):
         }
         if system:
             body["systemInstruction"] = {"parts": [{"text": system}]}
-        resp = requests.post(
-            GEMINI_URL.format(model=self.model),
-            headers={
-                "x-goog-api-key": os.environ["GEMINI_API_KEY"],
-                "Content-Type": "application/json",
-            },
-            json=body,
-            timeout=90,
-        )
-        if not resp.ok:
-            raise RuntimeError(f"{resp.status_code} from Gemini: {resp.text[:800]}")
-        data = resp.json()
-        candidates = data.get("candidates") or []
-        if not candidates:
-            raise RuntimeError(f"Gemini returned no candidates: {json.dumps(data)[:800]}")
-        parts = ((candidates[0].get("content") or {}).get("parts") or [])
-        texts = [p.get("text", "") for p in parts if not p.get("thought")]
-        return _parse_json_text("\n".join(texts), self.label)
+
+        last_err = None
+        max_attempts = 4
+        for attempt in range(max_attempts):
+            try:
+                resp = requests.post(
+                    GEMINI_URL.format(model=self.model),
+                    headers={
+                        "x-goog-api-key": os.environ["GEMINI_API_KEY"],
+                        "Content-Type": "application/json",
+                    },
+                    json=body,
+                    timeout=60,
+                )
+                if resp.status_code in (429, 503):
+                    last_err = RuntimeError(f"{resp.status_code} from Gemini: {resp.text[:800]}")
+                    if attempt < max_attempts - 1:
+                        time.sleep(2 * (attempt + 1))
+                        continue
+                if not resp.ok:
+                    raise RuntimeError(f"{resp.status_code} from Gemini: {resp.text[:800]}")
+                data = resp.json()
+                candidates = data.get("candidates") or []
+                if not candidates:
+                    raise RuntimeError(f"Gemini returned no candidates: {json.dumps(data)[:800]}")
+                parts = ((candidates[0].get("content") or {}).get("parts") or [])
+                texts = [p.get("text", "") for p in parts if not p.get("thought")]
+                return _parse_json_text("\n".join(texts), self.label)
+            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
+                last_err = exc
+                if attempt < max_attempts - 1:
+                    time.sleep(2 * (attempt + 1))
+                    continue
+                raise
+        if last_err:
+            raise last_err
 
 
 def make_bot(name: str = "gemini") -> CardBot:

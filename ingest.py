@@ -146,7 +146,7 @@ def scrape_url(spec: str) -> dict:
     resp = requests.get(
         spec,
         timeout=30,
-        headers={"User-Agent": "dough-research-ingest/0.1"},
+        headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"},
         stream=True,
     )
     try:

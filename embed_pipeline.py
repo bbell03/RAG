@@ -5,6 +5,9 @@ Dough Research Insight Card — Embedding Pipeline
 Turns cards.jsonl (schema.json) into a queryable vector index.
 
 Usage:
+    # .env in this folder (or the same exports in the shell):
+    #   VOYAGE_API_KEY=...
+    #   GEMINI_API_KEY=...
     export VOYAGE_API_KEY=...
     export GEMINI_API_KEY=...      # free Gemini drafts / validates; Voyage only embeds
     python embed_pipeline.py build --provider voyage
@@ -30,9 +33,17 @@ import argparse
 import json
 import os
 import sqlite3
+import warnings
 from typing import Dict, Iterable, List, Optional, Tuple
 
+warnings.filterwarnings("ignore", message=".*urllib3 v2 only supports OpenSSL.*")
+warnings.filterwarnings("ignore", message=".*compiled with 'LibreSSL.*")
+
 import numpy as np
+
+from synthesis import load_env
+
+load_env()
 
 from ingest import (
     CANDIDATES_PATH,
@@ -65,23 +76,43 @@ def _require_nonempty_texts(texts: List[str]) -> List[str]:
 
 
 def _post_embeddings(url: str, api_key: str, payload: dict) -> List[List[float]]:
-    """POST embeddings. Error bodies are truncated so a 400 cannot blow memory."""
+    """POST embeddings with retry on 429/503/timeout. Truncates error bodies."""
+    import time
     import requests
 
-    resp = requests.post(
-        url,
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        },
-        json=payload,
-        timeout=60,
-    )
-    if not resp.ok:
-        raise RuntimeError(f"{resp.status_code} from {url}: {resp.text[:800]}")
-    data = resp.json()["data"]
-    data = sorted(data, key=lambda d: d.get("index", 0))
-    return [d["embedding"] for d in data]
+    last_err = None
+    max_attempts = 4
+    for attempt in range(max_attempts):
+        try:
+            resp = requests.post(
+                url,
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+                timeout=60,
+            )
+            if resp.status_code in (429, 503):
+                last_err = RuntimeError(f"{resp.status_code} from {url}: {resp.text[:800]}")
+                if attempt < max_attempts - 1:
+                    # Exponential backoff for rate limits (free tier is 3 RPM)
+                    sleep_s = 15 * (attempt + 1)
+                    time.sleep(sleep_s)
+                    continue
+            if not resp.ok:
+                raise RuntimeError(f"{resp.status_code} from {url}: {resp.text[:800]}")
+            data = resp.json()["data"]
+            data = sorted(data, key=lambda d: d.get("index", 0))
+            return [d["embedding"] for d in data]
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
+            last_err = exc
+            if attempt < max_attempts - 1:
+                time.sleep(5 * (attempt + 1))
+                continue
+            raise
+    if last_err:
+        raise last_err
 
 
 def embed_voyage(
