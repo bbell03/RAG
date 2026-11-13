@@ -7,7 +7,7 @@ card confidence is only constrained by the draft cap.
 """
 
 from dataclasses import dataclass
-from typing import Callable, Iterable, Optional, Set
+from typing import Callable, Optional, Set
 
 
 @dataclass(frozen=True)
@@ -30,7 +30,7 @@ class ClaimLifecyclePolicy:
         known_claims: Optional[Set[str]] = None,
         duplicate_fn: Optional[Callable[[str], bool]] = None,
     ) -> PolicyDecision:
-        """Allow a new evidence-derived draft only with support, novelty, scope."""
+        """Allow a new evidence-derived draft only with support, novelty, and scope."""
         claim = _norm(card.get("claim"))
         verdict, score = _truth(truth)
         if verdict != "support" or score < self.support_threshold:
@@ -41,7 +41,10 @@ class ClaimLifecyclePolicy:
             return PolicyDecision(False, "claim duplicates a known normalized sentence")
         if duplicate_fn and duplicate_fn(card.get("claim", "")):
             return PolicyDecision(False, "semantic duplicate detected")
-        if not any(card.get(field) for field in ("style_scope", "phase", "relevance_targets", "variables")):
+        if not any(
+            card.get(field)
+            for field in ("style_scope", "phase", "relevance_targets", "variables")
+        ):
             return PolicyDecision(False, "claim lacks useful scope or variables")
         if _confidence(card) > self.draft_confidence_cap:
             return PolicyDecision(False, "draft confidence exceeds configured cap")
@@ -68,20 +71,37 @@ class ClaimLifecyclePolicy:
     ) -> PolicyDecision:
         """Require evidence for normal propagation; manual hypothesis mode is explicit."""
         verdict, score = _truth(truth)
-        if not explicit_hypothesis and (verdict != "support" or score < self.propagation_threshold):
+        if not explicit_hypothesis and (
+            verdict != "support" or score < self.propagation_threshold
+        ):
             return PolicyDecision(False, "propagation requires supported evidence above threshold")
+
+        parent_styles = set(_labels(parent.get("style_scope")))
+        child_styles = set(_labels(child.get("style_scope")))
+        parent_phase = set(_labels(parent.get("phase")))
+        child_phase = set(_labels(child.get("phase")))
+        parent_targets = set(_labels(parent.get("relevance_targets")))
+        child_targets = set(_labels(child.get("relevance_targets")))
+        parent_variables = set(_labels(parent.get("variables")))
+        child_variables = set(_labels(child.get("variables")))
+
         if direction == "specialize":
-            meaningful_scope_change = _scope_values(child, "style_scope", "phase", "relevance_targets") - _scope_values(parent, "style_scope", "phase", "relevance_targets")
-            if not meaningful_scope_change:
+            scope_delta = (
+                child_styles - parent_styles
+                or child_phase - parent_phase
+                or child_targets - parent_targets
+            )
+            if not scope_delta:
                 return PolicyDecision(False, "specialization does not change scope")
         elif direction == "expand":
-            broadens_style = "general" in _labels(child.get("style_scope")) and "general" not in _labels(parent.get("style_scope"))
-            adds_variable = bool(set(_labels(child.get("variables")))-set(_labels(parent.get("variables"))))
-            adds_style = bool(set(_labels(child.get("style_scope"))-set(_labels(parent.get("style_scope"))))
+            broadens_style = "general" in child_styles and "general" not in parent_styles
+            adds_variable = bool(child_variables - parent_variables)
+            adds_style = bool(child_styles - parent_styles)
             if not (broadens_style or adds_variable or adds_style):
                 return PolicyDecision(False, "expansion adds no style or variable coverage")
         else:
             return PolicyDecision(False, "direction must be specialize or expand")
+
         claim = _norm(child.get("claim"))
         if not claim:
             return PolicyDecision(False, "child claim is empty")
@@ -112,7 +132,9 @@ class ClaimLifecyclePolicy:
                 return PolicyDecision(False, "new learning cards must remain drafts")
             if _confidence(card) > self.draft_confidence_cap:
                 return PolicyDecision(False, "draft confidence exceeds configured cap")
-            if kind == "propagate" and not (op.get("parent_id") or parent or card.get("refines") or card.get("expands")):
+            if kind == "propagate" and not (
+                op.get("parent_id") or parent or card.get("refines") or card.get("expands")
+            ):
                 return PolicyDecision(False, "propagation must retain a parent relationship")
             return PolicyDecision(True, "draft structure verified")
         if kind in ("validate", "modify"):
@@ -154,20 +176,21 @@ def _labels(value) -> Set[str]:
     return {str(item).strip() for item in value if str(item).strip()}
 
 
-def _scope_values(card: dict, *fields: str) -> Set[str]:
-    return {f"{field}:{value}" for field in fields for value in _labels(card.get(field))}
-
-
 def _self_check():
-    """Small offline smoke check for the evidence/draft confidence separation."""
+    """Offline smoke check for evidence/draft confidence separation and gates."""
     policy = ClaimLifecyclePolicy()
     supported = {"verdict": "support", "score": 0.9}
-    child = {"id": "child", "claim": "Scoped learning claim", "confidence": 0.4,
-             "status": "draft", "phase": ["shaping"]}
+    child = {
+        "id": "child",
+        "claim": "Scoped learning claim",
+        "confidence": 0.4,
+        "status": "draft",
+        "phase": ["shaping"],
+    }
     assert policy.allow_create(child, supported).allowed
     assert policy.verify_operation({"op": "add", "card": child}).allowed
     assert not policy.allow_create(child, {"verdict": "support", "score": 0.2}).allowed
-    assert policy.allow_archive({"verdict": "conflict", "score": 0.8}, repairable=True).allowed is False
+    assert not policy.allow_archive({"verdict": "conflict", "score": 0.8}, repairable=True).allowed
     print("research lifecycle policy self-check ok")
 
 
