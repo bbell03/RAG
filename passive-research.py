@@ -125,6 +125,142 @@ RESEARCH_LIFECYCLE = {
 }
 
 
+class ClaimLifecyclePolicy:
+    """Explicit policy layer for creation, revision, propagation, and archival.
+
+    The values here are intentionally conservative: a claim must be novel,
+    evidence-backed, and scope-coherent before it becomes part of the library or a
+    propagated branch of the learning graph.
+    """
+
+    def __init__(
+        self,
+        support_threshold: float = 0.60,
+        draft_cap: float = DRAFT_CONFIDENCE_CAP,
+        propagation_threshold: float = 0.55,
+        archive_conflict_threshold: float = 0.35,
+    ):
+        self.support_threshold = float(support_threshold)
+        self.draft_cap = float(draft_cap)
+        self.propagation_threshold = float(propagation_threshold)
+        self.archive_conflict_threshold = float(archive_conflict_threshold)
+
+    def describe(self) -> str:
+        """Return a compact summary of the policy contract."""
+        return (
+            "claim-lifecycle-policy: "
+            "support_threshold={support} draft_cap={draft} propagation_threshold={prop} "
+            "archive_conflict_threshold={archive}".format(
+                support=self.support_threshold,
+                draft=self.draft_cap,
+                prop=self.propagation_threshold,
+                archive=self.archive_conflict_threshold,
+            )
+        )
+
+    def should_create_claim(self, card: Optional[dict], truth: Optional[dict], duplicate_fn: Optional[Callable[[str], bool]] = None) -> bool:
+        """True when a new card is eligible for creation as a draft.
+
+        Safety gates:
+          - verdict must support enough evidence to justify a draft
+          - novel sentence (deduped against existing cards)
+          - must have a meaningful scope or target, not a vague restatement
+        """
+        if not card:
+            return False
+        verdict = (truth or {}).get("verdict")
+        score = float((truth or {}).get("score") or 0.0)
+        claim = (card.get("claim") or "").strip()
+        if verdict not in ("support",):
+            return False
+        if score < self.support_threshold:
+            return False
+        if not claim:
+            return False
+        if duplicate_fn and duplicate_fn(claim):
+            return False
+        if not card.get("style_scope") and not card.get("relevance_targets") and not card.get("phase"):
+            return False
+        return True
+
+    def should_modify_claim(self, card: Optional[dict], truth: Optional[dict], revised_claim: Optional[str] = None) -> bool:
+        """True when the existing claim should be rewritten, not revalidated."""
+        if not card:
+            return False
+        verdict = (truth or {}).get("verdict")
+        if verdict != "support":
+            return False
+        if not revised_claim:
+            return False
+        if _norm_claim(revised_claim) == _norm_claim(card.get("claim") or ""):
+            return False
+        return True
+
+    def should_archive_claim(self, card: Optional[dict], truth: Optional[dict], repairable: bool = False) -> bool:
+        """True when a contradiction is strong enough to archive the claim.
+
+        Conflict alone is not enough; it must remain unresolved and not repairable
+        by narrowing the claim.
+        """
+        if not card:
+            return False
+        verdict = (truth or {}).get("verdict")
+        score = float((truth or {}).get("score") or 0.0)
+        if verdict != "conflict":
+            return False
+        if repairable:
+            return False
+        if score < self.archive_conflict_threshold:
+            return False
+        return True
+
+    def should_propagate_claim(self, parent: Optional[dict], child: Optional[dict], direction: str) -> bool:
+        """True when a child draft is meaningfully different and worth branching.
+
+        This is intentionally stricter than "direction is present". A child must
+        change scope or generality in a way that helps the learning system become
+        more useful, not just restate the same claim under a different label.
+        """
+        if not parent or not child:
+            return False
+        direction = str(direction or "").lower()
+        if direction not in ("specialize", "expand"):
+            return False
+        if direction == "specialize":
+            allowed = _context_shift(parent, child)
+        else:
+            allowed = _broadens(parent, child)
+        if not allowed:
+            return False
+        score = float((child.get("confidence") or 0.0))
+        if score > self.draft_cap:
+            return False
+        if not (child.get("claim") or "").strip():
+            return False
+        return True
+
+    def phase_gate(self, phase: str, card: Optional[dict] = None, truth: Optional[dict] = None) -> bool:
+        """A single entry point for phase-driven safety and debug visibility."""
+        phase = str(phase or "").strip()
+        if phase == "select_work":
+            return True
+        if phase == "retrieve_evidence":
+            return bool(card and card.get("claim"))
+        if phase == "assess_truth":
+            return bool(card and card.get("claim"))
+        if phase == "synthesize_actions":
+            return bool(card and (truth or {}).get("verdict") in ("support", "conflict"))
+        if phase == "enforce_policy":
+            return True
+        if phase == "verify_proposals":
+            return True
+        if phase == "commit":
+            return True
+        if phase == "schedule_next_cycle":
+            return True
+        return True
+
+
 def lifecycle_phase_summary() -> str:
     """Human-readable ordering of the research lifecycle use cases."""
     return " -> ".join(RESEARCH_LIFECYCLE.keys())
