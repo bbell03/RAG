@@ -1,9 +1,9 @@
-"""Deterministic claim lifecycle rules for passive research.
+"""Deterministic claim lifecycle rules for passive-research.py.
 
-This module deliberately does not call models, retrieval, or persistence. It
-keeps policy decisions independently testable. Evidence confidence and draft
-confidence are separate inputs: evidence_score gates evidence-dependent actions;
-card confidence is only constrained by the draft cap.
+No models, retrieval, or disk I/O. Evidence score gates create/modify/propagate/
+archive; card confidence is only checked against the draft cap (0.45).
+
+See passive-research.md for the operator-facing constraints table.
 """
 
 from dataclasses import dataclass

@@ -1,24 +1,25 @@
 """passive-research.py — Claims controller for the dough research library.
 
-This script intentionally reads top-to-bottom as a sequential research lifecycle:
+Research sessions run in three phases so the loop does not die once every
+card looks "done":
 
-  1. Selection: find weak / unverified claims.
-  2. Evidence: retrieve sources and assess support / conflict / insufficient.
-  3. Planning: build candidate library operations.
-  4. Policy: enforce deterministic claim lifecycle rules.
-  5. Verification: validate candidate operations before writes.
-  6. Write path: stage or commit updates and archive removals.
-  7. Repeat: revisit unresolved claims in bounded rounds.
+  1. Substantiate  weak / draft / unverified claims
+  2. Expand        supported claims that still lack workflow children
+  3. Seed          gap-filling drafts when the library has coverage holes
 
-The original behavior is retained. The refactor only adds clearer sectioning,
-inline notes, and explicit lifecycle boundaries so the logic is easier to test.
+Within each card pass:
+
+  select → retrieve/discover sources → assess truth → plan ops →
+  enforce ClaimLifecyclePolicy → confirm → stage/commit → rebuild index
 """
 
 import argparse
 import json
+import os
+import sys
 import time
-from datetime import date
-from typing import Callable, Dict, List, Optional, Set
+from datetime import date, datetime
+from typing import Callable, Dict, List, Optional, Set, Tuple
 
 from embed_pipeline import build_index, query
 from ingest import (
@@ -31,8 +32,9 @@ from ingest import (
     normalize_card,
     schema_enums,
 )
+from research_policy import ClaimLifecyclePolicy
 from synthesis import load_env
-from validate import evaluate_truth, is_url
+from validate import apply_sourcewise_tag, evaluate_truth, is_url
 
 # ---------------------------------------------------------------------------
 # 0. Setup and constants
@@ -40,10 +42,40 @@ from validate import evaluate_truth, is_url
 load_env()
 
 ARCHIVE_PATH = "archive.jsonl"
+REPORT_DIR = "research-reports"
+REPORT_LATEST = os.path.join(REPORT_DIR, "latest.md")
 DRAFT_CONFIDENCE_CAP = 0.45
 DEDUP_SIMILARITY = 0.82
 PROPAGATION_LIMIT = 3
 ADD_LIMIT = 2
+POLICY = ClaimLifecyclePolicy(draft_confidence_cap=DRAFT_CONFIDENCE_CAP)
+# Escalating search/verify depths: thin → medium → thorough.
+RESEARCH_DEPTHS = (
+    {"max_pages": 3, "max_candidates": 8, "search_limit": 4},
+    {"max_pages": 5, "max_candidates": 12, "search_limit": 6},
+    {"max_pages": 8, "max_candidates": 16, "search_limit": 8},
+)
+WORKFLOW_TARGETS = (
+    "fermentation_lab_dashboard",
+    "pizza_cart_app",
+    "mise_en_place",
+)
+PREFERRED_STYLES = ("ny_slice", "neapolitan", "sicilian", "al_taglio", "sourdough")
+PREFERRED_VARIABLES = (
+    "salt",
+    "flour_protein",
+    "bake_temp",
+    "bake_time",
+    "cold_ferment",
+    "humidity",
+    "leavening",
+    "extensibility",
+)
+
+
+def _log(message: str = "") -> None:
+    """Print and flush so tee'd long runs show progress immediately."""
+    print(message, flush=True)
 
 
 class ClaimOp:
@@ -85,6 +117,82 @@ def is_needing_substantiation(card: dict, confidence_bar: float = 0.65) -> bool:
     if verdict in (None, "insufficient", "skipped"):
         return True
     return False
+
+
+def _child_ids(parent_id: str, library: List[dict]) -> List[str]:
+    kids = []
+    for card in library:
+        cid = card.get("id")
+        if not cid:
+            continue
+        if parent_id in _labels(card.get("refines")) or parent_id in _labels(card.get("expands")):
+            kids.append(cid)
+    return kids
+
+
+def is_ripe_for_expansion(card: dict, library: List[dict], confidence_bar: float = 0.65) -> bool:
+    """Supported reviewed card that still has room for specialize/expand children."""
+    if not card.get("id"):
+        return False
+    corroboration = card.get("corroboration") or {}
+    if corroboration.get("verdict") != "support":
+        return False
+    if card.get("status") not in ("reviewed", "published"):
+        return False
+    if float(card.get("confidence") or 0.0) < confidence_bar:
+        return False
+    return len(_child_ids(card["id"], library)) < PROPAGATION_LIMIT
+
+
+def library_coverage_gaps(library: List[dict]) -> Tuple[List[str], List[str]]:
+    """Styles and variables the preferred vocab still lacks in the library."""
+    styles: Set[str] = set()
+    variables: Set[str] = set()
+    for card in library:
+        styles.update(_labels(card.get("style_scope")))
+        variables.update(_labels(card.get("variables")))
+    missing_styles = [s for s in PREFERRED_STYLES if s not in styles]
+    missing_vars = [v for v in PREFERRED_VARIABLES if v not in variables]
+    return missing_styles, missing_vars
+
+
+def select_batch(
+    library: List[dict],
+    unresolved: Set[str],
+    confidence_bar: float,
+    batch_size: int,
+    allow_propagate: bool,
+) -> Tuple[str, List[dict]]:
+    """Pick the next work phase and a batch of cards.
+
+    substantiate → expand → seed. Seed returns an empty card list; the session
+    drafts gap claims instead of researching an existing id.
+    """
+    weak = [
+        card
+        for card in library
+        if card.get("id") not in unresolved and is_needing_substantiation(card, confidence_bar)
+    ]
+    if weak:
+        weak.sort(
+            key=lambda card: (
+                0 if card.get("status") == "draft" else 1,
+                float(card.get("confidence") or 0.0),
+            )
+        )
+        return "substantiate", weak[:batch_size]
+
+    if allow_propagate:
+        ripe = [
+            card
+            for card in library
+            if card.get("id") not in unresolved and is_ripe_for_expansion(card, library, confidence_bar)
+        ]
+        if ripe:
+            ripe.sort(key=lambda card: -float(card.get("confidence") or 0.0))
+            return "expand", ripe[:batch_size]
+
+    return "seed", []
 
 
 def load_library_cards(path: str = CARDS_PATH) -> List[dict]:
@@ -293,7 +401,7 @@ def _apply_evidence(card: dict, truth: dict, claim_text: Optional[str] = None, w
         updated["status"] = "draft" if changed else "reviewed"
         cap = 0.35 if changed else 0.20
         updated["confidence"] = min(cap, score if score else cap)
-    return updated
+    return apply_sourcewise_tag(updated, truth)
 
 
 def _shape_draft(
@@ -306,7 +414,7 @@ def _shape_draft(
 ) -> dict:
     """Normalize a new learning card and cap it as an unreviewed draft."""
     source_type = "article" if is_url(reference) else "conversation"
-    refines = [link_id] if link_field == "refines" else []
+    refines = [link_id] if link_field == "refines" and link_id else []
     draft = normalize_card(
         {
             "claim": raw.get("claim"),
@@ -326,7 +434,7 @@ def _shape_draft(
     draft["status"] = "draft"
     draft["confidence"] = min(DRAFT_CONFIDENCE_CAP, float(draft.get("confidence") or 0.4))
     draft["origin"] = origin
-    if link_field == "expands":
+    if link_field == "expands" and link_id:
         draft["expands"] = [link_id]
         draft["refines"] = [item for item in (draft.get("refines") or []) if item != link_id]
     return draft
@@ -362,6 +470,22 @@ def _reconcile_action(verdict: str, plan: dict) -> str:
     return action
 
 
+def _verified(op: ClaimOp) -> Optional[ClaimOp]:
+    """Drop ops that fail structural lifecycle verification."""
+    decision = POLICY.verify_operation(
+        {
+            "op": op.op,
+            "card": op.card or {},
+            "card_id": op.card_id,
+            "parent_id": op.parent_id,
+        }
+    )
+    if decision.allowed:
+        return op
+    _log(f"  Policy rejected {op.op}: {decision.reason}")
+    return None
+
+
 def ops_from_plan(
     card: dict,
     truth: dict,
@@ -372,7 +496,11 @@ def ops_from_plan(
     propagate_unproven: bool = False,
     duplicate_fn: Optional[Callable[[str], bool]] = None,
 ) -> List[ClaimOp]:
-    """Turn a planner payload into concrete add / modify / remove / propagate ops."""
+    """Turn a planner payload into concrete add / modify / remove / propagate ops.
+
+    ClaimLifecyclePolicy gates create/modify/propagate/archive. Structural
+    verification runs before an op is returned.
+    """
     verdict = (truth or {}).get("verdict")
     if verdict not in ("support", "conflict"):
         return []
@@ -383,27 +511,55 @@ def ops_from_plan(
     ops: List[ClaimOp] = []
 
     if action == "modify" and plan.get("revised_claim"):
-        rewritten = _apply_evidence(card, truth, plan["revised_claim"], why)
-        if rewritten.get("claim") != card.get("claim"):
-            ops.append(ClaimOp("modify", why, card=rewritten, parent_id=parent_id))
+        modify_gate = POLICY.allow_modify(card.get("claim") or "", plan["revised_claim"], truth)
+        if modify_gate.allowed:
+            rewritten = _apply_evidence(card, truth, plan["revised_claim"], why)
+            if rewritten.get("claim") != card.get("claim"):
+                kept = _verified(ClaimOp("modify", why, card=rewritten, parent_id=parent_id))
+                if kept:
+                    ops.append(kept)
+            else:
+                action = "validate"
         else:
-            action = "validate"
+            _log(f"  Policy blocked modify: {modify_gate.reason}")
+            action = "validate" if verdict == "support" else action
     if action == "validate":
-        ops.append(ClaimOp("validate", why, card=_apply_evidence(card, truth, why=why), parent_id=parent_id))
-    elif action == "remove":
-        ops.append(
-            ClaimOp(
-                "remove",
-                why or "Contradicted and not repairable by a narrower claim.",
-                card_id=parent_id,
-                parent_id=parent_id,
-                fallback_card=_apply_evidence(card, truth, why=why),
-            )
+        kept = _verified(
+            ClaimOp("validate", why, card=_apply_evidence(card, truth, why=why), parent_id=parent_id)
         )
+        if kept:
+            ops.append(kept)
+    elif action == "remove":
+        repairable = bool(plan.get("revised_claim"))
+        archive_gate = POLICY.allow_archive(truth, repairable=repairable)
+        if archive_gate.allowed:
+            kept = _verified(
+                ClaimOp(
+                    "remove",
+                    why or "Contradicted and not repairable by a narrower claim.",
+                    card_id=parent_id,
+                    parent_id=parent_id,
+                    fallback_card=_apply_evidence(card, truth, why=why),
+                )
+            )
+            if kept:
+                ops.append(kept)
+        else:
+            _log(f"  Policy blocked archive: {archive_gate.reason}")
+            kept = _verified(
+                ClaimOp(
+                    "modify",
+                    archive_gate.reason,
+                    card=_apply_evidence(card, truth, why=why),
+                    parent_id=parent_id,
+                )
+            )
+            if kept:
+                ops.append(kept)
 
     if verdict != "support" and not propagate_unproven:
         return ops
-    if action == "remove":
+    if action == "remove" and any(op.op == "remove" for op in ops):
         return ops
 
     reference = _evidence_reference(truth or {}, card)
@@ -417,7 +573,6 @@ def ops_from_plan(
             return False
         if duplicate_fn and duplicate_fn(claim_text):
             return False
-        known.add(norm)
         return True
 
     if verdict == "support":
@@ -426,7 +581,14 @@ def ops_from_plan(
                 continue
             draft = _shape_draft(raw, taken, reference, "controller:add", parent_id, "refines")
             draft["refines"] = []
-            ops.append(ClaimOp("add", why, card=draft, parent_id=parent_id))
+            create_gate = POLICY.allow_create(draft, truth, known, duplicate_fn)
+            if not create_gate.allowed:
+                taken[:] = [item for item in taken if item != draft.get("id")]
+                continue
+            kept = _verified(ClaimOp("add", why, card=draft, parent_id=parent_id))
+            if kept:
+                ops.append(kept)
+                known.add(_norm_claim(draft.get("claim") or ""))
 
     if allow_propagate:
         emitted = 0
@@ -440,13 +602,24 @@ def ops_from_plan(
                 continue
             link_field = "refines" if direction == "specialize" else "expands"
             draft = _shape_draft(raw, taken, reference, f"controller:{direction}", parent_id, link_field)
+            prop_gate = POLICY.allow_propagate(
+                card,
+                draft,
+                direction,
+                truth,
+                known,
+                explicit_hypothesis=propagate_unproven,
+            )
+            if not prop_gate.allowed:
+                taken[:] = [item for item in taken if item != draft.get("id")]
+                continue
             if direction == "specialize":
                 key = _scope_key(draft)
                 if key in scopes:
                     taken[:] = [item for item in taken if item != draft.get("id")]
                     continue
                 scopes.add(key)
-            ops.append(
+            kept = _verified(
                 ClaimOp(
                     "propagate",
                     why,
@@ -455,7 +628,10 @@ def ops_from_plan(
                     direction=direction,
                 )
             )
-            emitted += 1
+            if kept:
+                ops.append(kept)
+                known.add(_norm_claim(draft.get("claim") or ""))
+                emitted += 1
     return ops
 
 
@@ -463,36 +639,379 @@ def ops_from_plan(
 # 4. Evidence retrieval and truth checking
 # ---------------------------------------------------------------------------
 
-def research_claim(card: dict, use_web: bool = True) -> tuple:
-    """Search evidence for one claim. Returns (verdict, summary, truth)."""
-    claim = card["claim"]
-    try:
-        hits = query(claim, top_k=3)
-    except Exception as exc:
-        truth = {"verdict": "error", "score": 0.0, "rationale": f"Retrieval failed: {exc}", "citations": []}
-        return "error", truth["rationale"], truth
+def _search_queries(card: dict) -> List[str]:
+    """Primary claim plus style/variable reformulations aimed at resolving doubts."""
+    claim = (card.get("claim") or "").strip()
+    styles = " ".join(_labels(card.get("style_scope")))
+    variables = " ".join(_labels(card.get("variables")))
+    queries = [claim] if claim else []
 
-    try:
-        truth = evaluate_truth(claim, hits, use_web=use_web)
-    except Exception as exc:
-        truth = {"verdict": "error", "score": 0.0, "rationale": f"Truth evaluation failed: {exc}", "citations": []}
-        return "error", truth["rationale"], truth
+    def _add(text: str) -> None:
+        cleaned = " ".join((text or "").split()).strip()
+        if cleaned and _norm_claim(cleaned) not in {_norm_claim(q) for q in queries}:
+            queries.append(cleaned)
 
+    _add(" ".join(part for part in (claim, styles, variables, "pizza dough") if part))
+    if styles and styles != "general":
+        _add(f"{styles} pizza dough {variables} {claim}")
+        _add(f"{styles} pizza bake temperature time oven")
+    if "bake_temp" in variables or "bake_time" in variables or "bake" in claim.lower():
+        _add(f"{styles or 'pizza'} pan dough oven temperature bake time vs neapolitan")
+        _add(f"{styles or 'sicilian'} steel pan bake temperature crumb set")
+    if "ferment" in claim.lower() or "cold_ferment" in variables:
+        _add(f"{styles or 'pizza'} cold fermentation protease extensibility evidence")
+    _add(f"{claim} food science source")
+    return queries[:6]
+
+
+def _summarize_truth(truth: dict) -> Tuple[str, str]:
     verdict = truth.get("verdict") or "insufficient"
     score = float(truth.get("score") or 0.0)
     rationale = truth.get("rationale") or "No rationale provided."
     citations = truth.get("citations") or []
     first_url = next((c.get("url") for c in citations if isinstance(c, dict) and c.get("url")), None)
     if verdict == "support":
-        summary = f"Supported (score: {score:.2f}) via {first_url or 'evidence'} - {rationale}"
-    elif verdict == "conflict":
-        summary = f"Contradicted (score: {score:.2f}) - {rationale}"
-    elif verdict in ("error", "skipped"):
-        summary = rationale
-    else:
-        summary = f"Insufficient evidence - {rationale}"
-        verdict = "insufficient" if verdict not in ("error", "skipped") else verdict
-    return verdict, summary, truth
+        return verdict, f"Supported (score: {score:.2f}) via {first_url or 'evidence'} - {rationale}"
+    if verdict == "conflict":
+        return verdict, f"Contradicted (score: {score:.2f}) - {rationale}"
+    if verdict in ("error", "skipped"):
+        return verdict, rationale
+    return "insufficient", f"Insufficient evidence - {rationale}"
+
+
+def _merge_truth_attempts(base: Optional[dict], nxt: dict) -> dict:
+    """Keep the strongest verdict while accumulating found/not_found/pages across depths."""
+    if not base:
+        return dict(nxt)
+    merged = dict(base)
+    rank = {"support": 3, "conflict": 3, "insufficient": 1, "skipped": 0, "error": 0}
+    if rank.get(nxt.get("verdict"), 0) >= rank.get(merged.get("verdict"), 0):
+        for key in ("verdict", "score", "rationale", "citations", "contradicts", "checked_at"):
+            if key in nxt:
+                merged[key] = nxt[key]
+    for key in ("found", "not_found", "open_doubts", "pages_checked", "pages_ok", "pages_failed", "urls_considered"):
+        seen = list(merged.get(key) or [])
+        for item in nxt.get(key) or []:
+            if item not in seen:
+                seen.append(item)
+        merged[key] = seen
+    merged["sources"] = _merge_source_lists(merged.get("sources") or [], nxt.get("sources") or [])
+    if "evidence_mode" in nxt:
+        merged["evidence_mode"] = nxt["evidence_mode"]
+    from validate import is_sourcewise_supported
+
+    merged["sourcewise_supported"] = is_sourcewise_supported(merged)
+    depths = list(merged.get("depths_tried") or [])
+    depths.extend(nxt.get("depths_tried") or [])
+    merged["depths_tried"] = depths
+    return merged
+
+
+def _merge_source_lists(base: List[dict], nxt: List[dict]) -> List[dict]:
+    """Union source inventories across research depths; prefer richer fetch/cite state."""
+    rank_status = {
+        "fetched_ok": 4,
+        "fetched_failed": 3,
+        "cited_only": 2,
+        "not_fetched": 1,
+        "skipped_internal": 1,
+        "not_applicable": 0,
+    }
+    by_key: dict = {}
+    order: List[str] = []
+
+    def _key(item: dict) -> str:
+        if item.get("kind") == "library" and item.get("id"):
+            return f"library:{item['id']}"
+        return f"url:{item.get('url') or ''}"
+
+    for item in list(base) + list(nxt):
+        key = _key(item)
+        if not key or key in ("url:", "library:"):
+            continue
+        existing = by_key.get(key)
+        if existing is None:
+            by_key[key] = dict(item)
+            order.append(key)
+            continue
+        combined = dict(existing)
+        if rank_status.get(item.get("fetch_status"), 0) > rank_status.get(combined.get("fetch_status"), 0):
+            combined["fetch_status"] = item.get("fetch_status")
+        if item.get("cited"):
+            combined["cited"] = True
+        for field in ("rank", "reason", "similarity", "claim", "discovered_via", "kind", "url", "id"):
+            if combined.get(field) in (None, "") and item.get(field) not in (None, ""):
+                combined[field] = item.get(field)
+        by_key[key] = combined
+    return [by_key[k] for k in order]
+
+
+def research_claim(card: dict, use_web: bool = True) -> tuple:
+    """Search evidence for one claim with escalating source depth.
+
+    Retries alternate queries and raises page/search budgets until support,
+    conflict, or depth is exhausted. Returns (verdict, summary, truth).
+    """
+    claim = card["claim"]
+    queries = _search_queries(card) or [claim]
+    best: Optional[Tuple[str, str, dict]] = None
+    accumulated: Optional[dict] = None
+
+    for depth_index, depth in enumerate(RESEARCH_DEPTHS):
+        search_text = queries[min(depth_index, len(queries) - 1)]
+        depth_queries = queries[: max(2, depth_index + 2)]
+        _log(
+            f"  Research depth {depth_index + 1}/{len(RESEARCH_DEPTHS)}: "
+            f"pages≤{depth['max_pages']}, search≤{depth['search_limit']}"
+        )
+        try:
+            hits = query(search_text, top_k=5)
+        except Exception as exc:
+            truth = {
+                "verdict": "error",
+                "score": 0.0,
+                "rationale": f"Retrieval failed: {exc}",
+                "citations": [],
+                "found": [],
+                "not_found": ["library retrieval failed"],
+                "open_doubts": [str(exc)],
+                "depths_tried": [depth],
+            }
+            accumulated = _merge_truth_attempts(accumulated, truth)
+            best = ("error", truth["rationale"], accumulated)
+            continue
+
+        extra_urls: List[str] = []
+        try:
+            from research_sources import discover_sources
+
+            discovered = discover_sources(
+                search_text,
+                hits,
+                use_web=use_web,
+                max_candidates=depth["max_candidates"],
+                search_limit=depth["search_limit"],
+                search_queries=depth_queries,
+            )
+            extra_urls = [item["url"] for item in discovered if item.get("url")]
+        except Exception:
+            extra_urls = []
+
+        try:
+            truth = evaluate_truth(
+                claim,
+                hits,
+                extra_urls=extra_urls,
+                use_web=use_web,
+                max_pages=depth["max_pages"],
+                search_limit=depth["search_limit"],
+                search_queries=depth_queries,
+            )
+        except Exception as exc:
+            truth = {
+                "verdict": "error",
+                "score": 0.0,
+                "rationale": f"Truth evaluation failed: {exc}",
+                "citations": [],
+                "found": [],
+                "not_found": [],
+                "open_doubts": [str(exc)],
+            }
+        truth["depths_tried"] = [depth]
+        truth["queries_used"] = depth_queries
+        accumulated = _merge_truth_attempts(accumulated, truth)
+        verdict, summary = _summarize_truth(accumulated)
+        pages_ok = accumulated.get("pages_ok") or []
+        sources = accumulated.get("sources") or []
+        cited = sum(1 for s in sources if s.get("cited"))
+        _log(
+            f"  Depth result: {verdict} | pages ok {len(pages_ok)} | "
+            f"sources {len(sources)} (cited {cited}) | "
+            f"urls considered {len(accumulated.get('urls_considered') or [])}"
+        )
+        if depth_index and search_text != claim:
+            summary = f"[depth {depth_index + 1}] {summary}"
+        best = (verdict, summary, accumulated)
+        if verdict in ("support", "conflict"):
+            return verdict, summary, accumulated
+        if depth_index < len(RESEARCH_DEPTHS) - 1 and verdict == "insufficient":
+            _log("  Thin evidence; escalating search/verify depth...")
+
+    return best or (
+        "insufficient",
+        "Insufficient evidence - no retrieval completed.",
+        {
+            "verdict": "insufficient",
+            "score": 0.0,
+            "rationale": "no retrieval",
+            "citations": [],
+            "found": [],
+            "not_found": ["no sources retrieved"],
+            "open_doubts": ["research loop never obtained evidence"],
+        },
+    )
+
+
+def _claim_note(
+    card: dict,
+    phase: str,
+    verdict: str,
+    summary: str,
+    truth: dict,
+    actions: Optional[List[str]] = None,
+) -> dict:
+    """Basis-level note for one claim pass: what was found, missing, and concluded."""
+    conclusion = {
+        "support": "Claim resolved as supported.",
+        "conflict": "Claim resolved as contradicted.",
+        "insufficient": "Claim unresolved; sources were inadequate after escalation.",
+        "error": "Claim unresolved due to retrieval/critic error.",
+        "skipped": "Claim skipped; critic unavailable.",
+    }.get(verdict, "Claim unresolved.")
+    return {
+        "id": card.get("id"),
+        "claim": card.get("claim"),
+        "phase": phase,
+        "verdict": verdict,
+        "summary": summary,
+        "conclusion": conclusion,
+        "found": list(truth.get("found") or []),
+        "not_found": list(truth.get("not_found") or []),
+        "open_doubts": list(truth.get("open_doubts") or []),
+        "pages_ok": list(truth.get("pages_ok") or truth.get("pages_checked") or []),
+        "pages_failed": list(truth.get("pages_failed") or []),
+        "urls_considered": list(truth.get("urls_considered") or []),
+        "sources": list(truth.get("sources") or []),
+        "sourcewise_supported": bool(truth.get("sourcewise_supported")),
+        "evidence_mode": truth.get("evidence_mode"),
+        "actions": list(actions or []),
+        "checked_at": truth.get("checked_at") or date.today().isoformat(),
+    }
+
+
+def format_research_report(notes: List[dict], session_meta: Optional[dict] = None) -> str:
+    """Render a coherent basis-level session report."""
+    meta = session_meta or {}
+    lines = [
+        "# Research loop report",
+        "",
+        f"- Generated: {date.today().isoformat()}",
+        f"- Actions applied: {meta.get('actions', 0)}",
+        f"- Claims examined: {len(notes)}",
+        "",
+    ]
+    if not notes:
+        lines.append("No claims were researched in this session.")
+        lines.append("")
+        return "\n".join(lines)
+
+    resolved = [n for n in notes if n.get("verdict") in ("support", "conflict")]
+    unresolved = [n for n in notes if n.get("verdict") not in ("support", "conflict")]
+    lines.append("## Session conclusion")
+    lines.append("")
+    lines.append(
+        f"{len(resolved)} claim(s) reached a support/conflict conclusion; "
+        f"{len(unresolved)} remain open after escalated sourcing."
+    )
+    lines.append("")
+
+    for note in notes:
+        lines.append(f"## [{note.get('id')}]")
+        lines.append("")
+        lines.append(f"**Claim:** {note.get('claim')}")
+        lines.append(f"**Phase:** {note.get('phase')}")
+        lines.append(f"**Verdict:** {note.get('verdict')}")
+        lines.append(f"**Conclusion:** {note.get('conclusion')}")
+        lines.append(f"**Evidence summary:** {note.get('summary')}")
+        lines.append("")
+        lines.append("### Found")
+        for item in note.get("found") or ["(nothing concrete extracted from sources)"]:
+            lines.append(f"- {item}")
+        lines.append("")
+        lines.append("### Not found")
+        for item in note.get("not_found") or ["(critic did not list missing evidence)"]:
+            lines.append(f"- {item}")
+        lines.append("")
+        lines.append("### Open doubts")
+        for item in note.get("open_doubts") or ["(none recorded)"]:
+            lines.append(f"- {item}")
+        lines.append("")
+        lines.append("### Full source list")
+        sources = note.get("sources") or []
+        if sources:
+            for src in sources:
+                kind = src.get("kind") or "?"
+                status = src.get("fetch_status") or "?"
+                cited = "cited" if src.get("cited") else "not-cited"
+                label = src.get("url") or src.get("id") or "(unnamed)"
+                extra = ""
+                if src.get("kind") == "library" and src.get("id"):
+                    extra = f" id={src.get('id')}"
+                    if src.get("similarity") is not None:
+                        extra += f" sim={src.get('similarity')}"
+                elif src.get("discovered_via"):
+                    extra = f" via={src.get('discovered_via')}"
+                lines.append(f"- [{kind}/{status}/{cited}] {label}{extra}")
+        else:
+            pages = note.get("pages_ok") or []
+            if pages:
+                for url in pages:
+                    lines.append(f"- ok: {url}")
+            else:
+                lines.append("- (no sources recorded)")
+            for url in note.get("pages_failed") or []:
+                lines.append(f"- failed: {url}")
+        if note.get("sourcewise_supported"):
+            lines.append("- tag: sourcewise_supported")
+        lines.append("")
+        lines.append("### Actions")
+        for item in note.get("actions") or ["(no library edits)"]:
+            lines.append(f"- {item}")
+        lines.append("")
+    return "\n".join(lines)
+
+
+def _timestamped_report_path(when: Optional[datetime] = None) -> str:
+    """research-reports/YYYY-MM-DDTHHMMSS.md (local time)."""
+    stamp = (when or datetime.now()).strftime("%Y-%m-%dT%H%M%S")
+    return os.path.join(REPORT_DIR, f"{stamp}.md")
+
+
+def write_research_report(
+    notes: List[dict],
+    session_meta: Optional[dict] = None,
+    path: Optional[str] = None,
+) -> str:
+    """Write a timestamped session report under research-reports/ and refresh latest.md."""
+    text = format_research_report(notes, session_meta=session_meta)
+    os.makedirs(REPORT_DIR, exist_ok=True)
+    target = path or _timestamped_report_path()
+    with open(target, "w", encoding="utf-8") as handle:
+        handle.write(text)
+    with open(REPORT_LATEST, "w", encoding="utf-8") as handle:
+        handle.write(text)
+    return target
+
+
+def record_research_attempt(card: dict, truth: dict) -> None:
+    """Persist corroboration attempt on an unresolved card without raising confidence."""
+    library = load_library_cards()
+    cid = card.get("id")
+    updated = False
+    for index, existing in enumerate(library):
+        if existing.get("id") != cid:
+            continue
+        next_card = apply_sourcewise_tag(dict(existing), truth)
+        next_card["corroboration"] = truth
+        next_card["research_attempted_at"] = date.today().isoformat()
+        library[index] = next_card
+        updated = True
+        break
+    if not updated:
+        return
+    with open(CARDS_PATH, "w", encoding="utf-8") as handle:
+        for item in library:
+            handle.write(json.dumps(item, ensure_ascii=False) + "\n")
 
 
 def _library_duplicate(claim: str, parent_id: Optional[str]) -> bool:
@@ -534,8 +1053,14 @@ class ClaimsController:
         truth: dict,
         propagate_unproven: bool = False,
         check_similarity: bool = True,
+        force_propagate: bool = False,
+        skip_parent_edit: bool = False,
     ) -> List[ClaimOp]:
-        """Plan library edits for one card. Does not write."""
+        """Plan library edits for one card. Does not write.
+
+        If support yields no propagate ops, request a focused propagation plan
+        once so validated claims still fan into workflows.
+        """
         verdict = (truth or {}).get("verdict")
         if verdict not in ("support", "conflict") and not propagate_unproven:
             return []
@@ -562,8 +1087,44 @@ class ClaimsController:
             propagate_unproven=propagate_unproven,
             duplicate_fn=duplicate_fn,
         )
-        if propagate_unproven:
-            ops = [op for op in ops if op.op == "propagate"]
+        has_propagate = any(op.op == "propagate" for op in ops)
+        ripe = is_ripe_for_expansion(
+            {
+                **card,
+                "status": "reviewed",
+                "confidence": max(float(card.get("confidence") or 0), 0.75),
+                "corroboration": working_truth,
+            },
+            self.library,
+        )
+        needs_propagate = (
+            self.allow_propagate
+            and working_truth.get("verdict") == "support"
+            and not has_propagate
+            and (force_propagate or ripe)
+        )
+        if needs_propagate and not propagate_unproven:
+            _log("  Planner returned no workflow drafts; requesting focused propagations...")
+            prop_plan = self._plan_propagations(card, working_truth)
+            more = ops_from_plan(
+                card,
+                working_truth,
+                {
+                    "action": "validate",
+                    "revised_claim": None,
+                    "why": prop_plan.get("why") or working_truth.get("rationale") or why_from(plan),
+                    "adds": [],
+                    "propagations": prop_plan.get("propagations") or [],
+                },
+                self.library,
+                self.taken,
+                allow_propagate=True,
+                propagate_unproven=False,
+                duplicate_fn=duplicate_fn,
+            )
+            ops.extend(op for op in more if op.op == "propagate")
+        if propagate_unproven or skip_parent_edit:
+            ops = [op for op in ops if op.op in ("propagate", "add")]
         return ops
 
     def _plan(self, card: dict, truth: dict) -> dict:
@@ -584,8 +1145,27 @@ class ClaimsController:
             }
             return make_bot(name).plan_claim(card, evidence, self.library)
         except Exception as exc:
-            print(f"  Planner unavailable ({exc}). Using the critic verdict only.")
+            _log(f"  Planner unavailable ({exc}). Using the critic verdict only.")
             return _fallback_plan(truth or {})
+
+    def _plan_propagations(self, card: dict, truth: dict) -> dict:
+        try:
+            from synthesis import make_bot
+            from validate import resolve_critic
+
+            name = resolve_critic(None)
+            if not name:
+                raise RuntimeError("no chat model configured")
+            evidence = {
+                "verdict": (truth or {}).get("verdict"),
+                "score": (truth or {}).get("score"),
+                "rationale": (truth or {}).get("rationale"),
+                "citations": (truth or {}).get("citations") or [],
+            }
+            return make_bot(name).plan_propagations(card, evidence, self.library)
+        except Exception as exc:
+            _log(f"  Propagation planner unavailable ({exc}).")
+            return {"action": "validate", "revised_claim": None, "why": str(exc), "adds": [], "propagations": []}
 
     def remember(self, op: ClaimOp) -> None:
         """Keep later proposals from duplicating a card accepted earlier in the session."""
@@ -595,6 +1175,80 @@ class ClaimsController:
                 self.taken.append(op.card["id"])
         elif op.card and op.op in ("validate", "modify"):
             self.by_id[op.card["id"]] = op.card
+
+
+def why_from(plan: dict) -> str:
+    return (plan or {}).get("why") or ""
+
+
+def seed_gap_ops(library: List[dict], taken: List[str], limit: int = 2) -> List[ClaimOp]:
+    """Draft gap-filling claims from library coverage holes. Confidence capped."""
+    missing_styles, missing_vars = library_coverage_gaps(library)
+    if missing_styles:
+        question = (
+            f"What important pizza-dough mechanisms are missing for {missing_styles[0]} style? "
+            "Draft atomic falsifiable claims."
+        )
+    elif missing_vars:
+        question = (
+            f"How does {missing_vars[0]} affect pizza dough fermentation or handling? "
+            "Draft atomic falsifiable claims the library lacks."
+        )
+    else:
+        question = (
+            "Draft novel pizza-dough research claims about bake temperature, cold ferment, "
+            "or dough diagnostics that are not already in the library."
+        )
+    _log(f"  Seeding gaps from: {question}")
+    try:
+        from synthesis import make_bot
+        from validate import resolve_critic
+
+        name = resolve_critic(None)
+        if not name:
+            raise RuntimeError("no chat model configured")
+        slim = [
+            {
+                "id": card.get("id"),
+                "claim": (card.get("claim") or "")[:200],
+                "variables": card.get("variables"),
+                "style_scope": card.get("style_scope"),
+            }
+            for card in library[:30]
+        ]
+        payload = make_bot(name).synthesize(question, slim, retrieval=0.2, threshold=0.7)
+    except Exception as exc:
+        _log(f"  Gap seeder unavailable ({exc}).")
+        return []
+
+    known = _known_claims(library)
+    ops: List[ClaimOp] = []
+    for raw in (payload.get("cards") or [])[:limit]:
+        claim = " ".join(str(raw.get("claim") or "").split()).strip()
+        if not claim or _norm_claim(claim) in known:
+            continue
+        if _library_duplicate(claim, None):
+            continue
+        draft = _shape_draft(
+            raw,
+            taken,
+            "controller:seed",
+            "controller:seed",
+            "",
+            "refines",
+        )
+        draft["refines"] = []
+        draft["origin"] = "controller:seed"
+        fake_truth = {"verdict": "support", "score": 0.7, "rationale": "gap seed", "citations": []}
+        gate = POLICY.allow_create(draft, fake_truth, known)
+        if not gate.allowed:
+            taken[:] = [item for item in taken if item != draft.get("id")]
+            continue
+        kept = _verified(ClaimOp("add", f"Seeded library gap: {question}", card=draft))
+        if kept:
+            ops.append(kept)
+            known.add(_norm_claim(claim))
+    return ops
 
 
 def format_op(op: ClaimOp) -> str:
@@ -767,102 +1421,234 @@ def research_session(
     until_done: bool = False,
     allow_propagate: bool = True,
     only_id: Optional[str] = None,
+    explore: bool = False,
+    use_web: bool = True,
 ) -> None:
-    """Scan weak claims and run the controller on each piece of evidence."""
+    """Run substantiate → expand → seed until bounds are hit.
+
+    Default one-shot still researches weak claims. `--until-done` or `--explore`
+    continues into expansion of supported cards and gap seeding so the loop
+    keeps producing new drafts after the library looks settled.
+
+    use_web=True is external evidence (library + web). use_web=False is
+    internal evidence (library neighbors only, no HTTP).
+    """
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except Exception:
+        pass
+
     actions = 0
     unresolved: Set[str] = set()
+    expanded_ids: Set[str] = set()
+    exhausted_ids: Set[str] = set()
+    seed_rounds = 0
     round_n = 0
-    print("\n" + "=" * 60)
-    print("  CLAIMS CONTROLLER")
-    print(
+    continuous = until_done or explore
+    notes: List[dict] = []
+    evidence_mode = "external" if use_web else "internal"
+
+    _log("\n" + "=" * 60)
+    _log("  CLAIMS CONTROLLER")
+    _log(
         f"  Confidence {confidence_bar} | batch {batch_size} | "
-        f"max actions {max_actions} | propagate {allow_propagate}"
+        f"max actions {max_actions} | propagate {allow_propagate} | "
+        f"explore {continuous} | evidence {evidence_mode}"
     )
-    print("=" * 60)
+    _log("=" * 60)
 
     while True:
         round_n += 1
         library = load_library_cards()
         controller = ClaimsController(library, allow_propagate=allow_propagate)
-        if only_id:
-            needy = [card for card in library if card.get("id") == only_id]
-            if not needy:
-                print(f"No card with id {only_id}.")
-                return
-        else:
-            needy = [
-                card
-                for card in library
-                if card.get("id") not in unresolved and is_needing_substantiation(card, confidence_bar)
-            ]
-        if not needy:
-            print("\nNo claims left below the confidence bar.")
-            break
-
-        print(f"\nRound {round_n}: {len(needy)} claim(s) still open. Scanning {min(batch_size, len(needy))}.")
         progressed = False
+        researched_this_round = False
         quit_session = False
         accepted_round: List[ClaimOp] = []
 
-        for card in needy[:batch_size]:
-            if actions >= max_actions:
-                print(f"\n[Limit] Max actions ({max_actions}) reached.")
-                quit_session = True
-                break
-            cid = card.get("id")
-            print("\n" + "-" * 60)
-            print(f"Target [{cid}]")
-            print(f"  \"{card.get('claim')}\"")
-            print(
-                f"  Confidence {float(card.get('confidence') or 0):.2f} | "
-                f"status {card.get('status', 'draft')} | "
-                f"style {card.get('style_scope')} | target {card.get('relevance_targets')}"
+        if only_id:
+            phase, batch = "substantiate", [card for card in library if card.get("id") == only_id]
+            if not batch:
+                _log(f"No card with id {only_id}.")
+                return
+        else:
+            phase, batch = select_batch(
+                library,
+                unresolved | expanded_ids | exhausted_ids,
+                confidence_bar,
+                batch_size,
+                allow_propagate=allow_propagate and continuous,
             )
-            verdict, summary, truth = research_claim(card, use_web=True)
-            print(f"  Evidence: {summary}")
-            if verdict in ("insufficient", "error", "skipped"):
-                print("  >>> No library edit. Evidence does not support a change.")
-                unresolved.add(cid)
-                time.sleep(delay)
-                continue
 
+        if phase == "seed":
+            if not continuous:
+                _log("\nNo claims left below the confidence bar.")
+                _log("Pass --until-done or --explore to expand supported claims and seed gaps.")
+                break
+            if seed_rounds >= 3:
+                _log("\nSeed round cap reached.")
+                break
+            if actions >= max_actions:
+                _log(f"\n[Limit] Max actions ({max_actions}) reached.")
+                break
+            _log(f"\nRound {round_n}: phase=seed (coverage gaps)")
+            missing_styles, missing_vars = library_coverage_gaps(library)
+            _log(f"  Missing styles: {missing_styles or '—'} | Missing variables: {missing_vars or '—'}")
             remaining = max_actions - actions
-            ops = controller.propose(card, truth)[:remaining]
+            ops = seed_gap_ops(library, controller.taken, limit=min(2, remaining))
+            seed_rounds += 1
             if not ops:
-                print("  >>> Controller proposed no edits.")
-                unresolved.add(cid)
-                time.sleep(delay)
-                continue
-
+                _log("  No new gap drafts produced. Stopping.")
+                break
             accepted, quit_session = confirm_ops(ops, interactive=interactive)
-            if not any(op.op in ("validate", "modify", "remove") for op in accepted):
-                unresolved.add(cid)
             for op in accepted:
                 controller.remember(op)
             accepted_round.extend(accepted)
             actions += len(accepted)
-            progressed = progressed or bool(accepted)
-            time.sleep(delay)
-            if quit_session:
-                break
+            progressed = bool(accepted)
+        else:
+            _log(
+                f"\nRound {round_n}: phase={phase} | "
+                f"{len(batch)} card(s) queued (showing {min(batch_size, len(batch))})."
+            )
+            for card in batch:
+                if actions >= max_actions:
+                    _log(f"\n[Limit] Max actions ({max_actions}) reached.")
+                    quit_session = True
+                    break
+                cid = card.get("id")
+                _log("\n" + "-" * 60)
+                _log(f"Target [{cid}] ({phase})")
+                _log(f"  \"{card.get('claim')}\"")
+                _log(
+                    f"  Confidence {float(card.get('confidence') or 0):.2f} | "
+                    f"status {card.get('status', 'draft')} | "
+                    f"style {card.get('style_scope')} | target {card.get('relevance_targets')}"
+                )
+
+                note_actions: List[str] = []
+                if phase == "expand":
+                    truth = dict(card.get("corroboration") or {})
+                    if truth.get("verdict") != "support":
+                        researched_this_round = True
+                        verdict, summary, truth = research_claim(card, use_web=use_web)
+                        _log(f"  Evidence ({evidence_mode}): {summary}")
+                        if verdict != "support":
+                            record_research_attempt(card, truth)
+                            notes.append(
+                                _claim_note(card, phase, verdict, summary, truth, ["recorded unresolved attempt"])
+                            )
+                            unresolved.add(cid)
+                            exhausted_ids.add(cid)
+                            expanded_ids.add(cid)
+                            time.sleep(delay)
+                            continue
+                    else:
+                        _log(
+                            f"  Using prior support (score: {float(truth.get('score') or 0):.2f}); "
+                            "expanding into workflow drafts."
+                        )
+                        summary = "Prior support reused for expansion."
+                        verdict = "support"
+                    remaining = max_actions - actions
+                    ops = controller.propose(
+                        card,
+                        truth,
+                        force_propagate=True,
+                        skip_parent_edit=True,
+                    )[:remaining]
+                    expanded_ids.add(cid)
+                else:
+                    researched_this_round = True
+                    verdict, summary, truth = research_claim(card, use_web=use_web)
+                    _log(f"  Evidence ({evidence_mode}): {summary}")
+                    if truth.get("found"):
+                        _log("  Found:")
+                        for item in truth["found"][:5]:
+                            _log(f"    - {item}")
+                    if truth.get("not_found"):
+                        _log("  Not found:")
+                        for item in truth["not_found"][:5]:
+                            _log(f"    - {item}")
+                    if truth.get("open_doubts"):
+                        _log("  Open doubts:")
+                        for item in truth["open_doubts"][:5]:
+                            _log(f"    - {item}")
+                    if verdict in ("insufficient", "error", "skipped"):
+                        _log("  >>> No library edit. Evidence does not support a change after escalation.")
+                        record_research_attempt(card, truth)
+                        notes.append(
+                            _claim_note(
+                                card,
+                                phase,
+                                verdict,
+                                summary,
+                                truth,
+                                ["recorded unresolved attempt; depths exhausted"],
+                            )
+                        )
+                        unresolved.add(cid)
+                        exhausted_ids.add(cid)
+                        time.sleep(delay)
+                        continue
+                    remaining = max_actions - actions
+                    ops = controller.propose(card, truth)[:remaining]
+
+                if not ops:
+                    _log("  >>> Controller proposed no edits.")
+                    notes.append(
+                        _claim_note(card, phase, verdict, summary, truth, ["critic decisive but no ops proposed"])
+                    )
+                    unresolved.add(cid)
+                    exhausted_ids.add(cid)
+                    time.sleep(delay)
+                    continue
+
+                accepted, quit_session = confirm_ops(ops, interactive=interactive)
+                if phase == "substantiate" and not any(
+                    op.op in ("validate", "modify", "remove") for op in accepted
+                ):
+                    unresolved.add(cid)
+                for op in accepted:
+                    controller.remember(op)
+                    note_actions.append(f"{op.op}: {op.reason[:160]}")
+                notes.append(_claim_note(card, phase, verdict, summary, truth, note_actions or ["(none accepted)"]))
+                accepted_round.extend(accepted)
+                actions += len(accepted)
+                progressed = progressed or bool(accepted)
+                time.sleep(delay)
+                if quit_session:
+                    break
 
         if accepted_round:
-            print("\n" + "=" * 60)
-            print("  APPLY")
-            print("=" * 60)
+            _log("\n" + "=" * 60)
+            _log("  APPLY")
+            _log("=" * 60)
             apply_ops(accepted_round, auto_commit=auto_commit, interactive=interactive)
 
-        if quit_session or not until_done or only_id:
+        if quit_session or only_id:
             break
-        if not progressed:
-            print("\nNo further corroborated edits. Stopping.")
+        if not continuous:
             break
-        if round_n >= 20:
-            print("\nRound cap reached.")
+        # Exhausted depth on a claim still counts as research progress for the
+        # medium; continue into expand/seed. Stop only when a round neither
+        # applied edits nor ran any search/verify work.
+        if not progressed and not researched_this_round:
+            _log("\nNo further corroborated edits or researchable claims. Stopping.")
+            break
+        if round_n >= 30:
+            _log("\nRound cap reached.")
             break
 
+    report_path = write_research_report(notes, session_meta={"actions": actions})
+    _log("\n" + "=" * 60)
+    _log("  RESEARCH REPORT")
+    _log("=" * 60)
+    _log(format_research_report(notes, session_meta={"actions": actions}))
+    _log(f"Wrote basis report → {report_path}")
+
     if unresolved:
-        print(f"\nUnsettled this session ({len(unresolved)}): {', '.join(sorted(unresolved))}")
+        _log(f"\nUnsettled this session ({len(unresolved)}): {', '.join(sorted(unresolved))}")
 
 
 # ---------------------------------------------------------------------------
@@ -931,8 +1717,9 @@ def command_modify(args) -> None:
         apply_ops(accepted, auto_commit=args.commit or not args.interactive, interactive=args.interactive)
         return
 
-    verdict, summary, truth = research_claim(card, use_web=not args.no_web)
-    print(f"Evidence: {summary}")
+    use_web = _use_web_from_args(args)
+    verdict, summary, truth = research_claim(card, use_web=use_web)
+    print(f"Evidence ({'external' if use_web else 'internal'}): {summary}")
     controller = ClaimsController(load_library_cards(), allow_propagate=not args.no_propagate)
     ops = controller.propose(card, truth)
     if not ops:
@@ -962,9 +1749,13 @@ def command_propagate(args) -> None:
     """Draft specialize / expand cards for one existing claim."""
     card = _card_or_die(args.id)
     truth = card.get("corroboration") or {}
-    if not args.no_web and truth.get("verdict") not in ("support", "conflict"):
+    use_web = _use_web_from_args(args)
+    if use_web and truth.get("verdict") not in ("support", "conflict"):
         verdict, summary, truth = research_claim(card, use_web=True)
-        print(f"Evidence: {summary} ({verdict})")
+        print(f"Evidence (external): {summary} ({verdict})")
+    elif not use_web and truth.get("verdict") not in ("support", "conflict"):
+        verdict, summary, truth = research_claim(card, use_web=False)
+        print(f"Evidence (internal): {summary} ({verdict})")
     controller = ClaimsController(load_library_cards(), allow_propagate=True)
     ops = controller.propose(card, truth, propagate_unproven=True)
     if not ops:
@@ -986,6 +1777,15 @@ def command_propagate(args) -> None:
 # 9. CLI parser and main entry
 # ---------------------------------------------------------------------------
 
+def _use_web_from_args(args) -> bool:
+    """True for external evidence. --evidence wins; --no-web means internal."""
+    if getattr(args, "evidence", None) == "internal":
+        return False
+    if getattr(args, "evidence", None) == "external":
+        return True
+    return not bool(getattr(args, "no_web", False))
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Claims controller: add, modify, remove, and propagate dough-research claims from evidence."
@@ -998,14 +1798,29 @@ def build_parser() -> argparse.ArgumentParser:
         help="research scans weak claims. The other commands act on one card.",
     )
     parser.add_argument("--interactive", "-i", action="store_true", help="Confirm each operation.")
-    parser.add_argument("--until-done", action="store_true", help="Keep scanning until claims settle or evidence runs out.")
+    parser.add_argument(
+        "--until-done",
+        action="store_true",
+        help="Continue through substantiate → expand → seed until bounds are hit.",
+    )
+    parser.add_argument(
+        "--explore",
+        action="store_true",
+        help="Same continuous phases as --until-done: expand supported claims and seed coverage gaps.",
+    )
     parser.add_argument("--max-actions", type=int, default=10, help="Cap on applied operations per session.")
-    parser.add_argument("--batch-size", type=int, default=5, help="Weak claims to research per round.")
-    parser.add_argument("--confidence-bar", type=float, default=0.65, help="Claims below this are researched.")
+    parser.add_argument("--batch-size", type=int, default=5, help="Cards to research per round.")
+    parser.add_argument("--confidence-bar", type=float, default=0.65, help="Claims below this are researched first.")
     parser.add_argument("--delay", type=float, default=3.0, help="Seconds between web lookups.")
     parser.add_argument("--commit", action="store_true", help="Write new drafts into cards.jsonl and rebuild the index.")
     parser.add_argument("--no-propagate", action="store_true", help="Do not fan claims out into workflow drafts.")
-    parser.add_argument("--no-web", action="store_true", help="Skip web lookup on modify/propagate.")
+    parser.add_argument(
+        "--evidence",
+        choices=["internal", "external"],
+        default=None,
+        help="internal = library neighbors only. external = library + web (default).",
+    )
+    parser.add_argument("--no-web", action="store_true", help="Alias for --evidence internal.")
     parser.add_argument("--id", default=None, help="Card id for modify, remove, propagate, or a single research target.")
     parser.add_argument("--claim", default=None, help="Claim text for add, or the replacement sentence for modify.")
     parser.add_argument("--style", default=None, help="Comma-separated style_scope for add.")
@@ -1051,6 +1866,8 @@ def main() -> None:
         until_done=args.until_done,
         allow_propagate=not args.no_propagate,
         only_id=args.id,
+        explore=args.explore,
+        use_web=_use_web_from_args(args),
     )
 
 
@@ -1143,6 +1960,7 @@ def _self_check() -> None:
     assert ops[0].card["id"] == "cold-open"
     assert ops[0].card["prior_claim"] == parent["claim"]
     assert ops[0].card["confidence"] >= 0.75
+    assert "sourcewise_supported" in (ops[0].card.get("tags") or [])
     assert "add" in kinds
     directions = [op.direction for op in ops if op.op == "propagate"]
     assert directions == ["specialize", "expand"], directions
@@ -1161,7 +1979,18 @@ def _self_check() -> None:
     assert all(op.op != "propagate" for op in quiet)
     assert any(op.op == "add" for op in quiet)
 
-    conflict = {"verdict": "conflict", "score": 0.2, "rationale": "sources disagree", "citations": []}
+    weak_conflict = {"verdict": "conflict", "score": 0.2, "rationale": "weak conflict", "citations": []}
+    demoted = ops_from_plan(
+        parent,
+        weak_conflict,
+        {"action": "remove", "revised_claim": None, "why": "not repairable", "adds": [], "propagations": []},
+        library,
+        list(taken),
+    )
+    assert [op.op for op in demoted] == ["modify"], demoted
+    assert demoted[0].card["confidence"] <= 0.20
+
+    conflict = {"verdict": "conflict", "score": 0.8, "rationale": "sources disagree", "citations": []}
     removed = ops_from_plan(
         parent,
         conflict,
@@ -1189,6 +2018,56 @@ def _self_check() -> None:
         library,
         list(taken),
     ) == []
+
+    draft = {
+        "id": "seed-draft",
+        "claim": "Sicilian pan dough needs a longer bake than Neapolitan.",
+        "confidence": 0.4,
+        "status": "draft",
+        "style_scope": ["sicilian"],
+        "variables": ["bake_time"],
+    }
+    supported = {
+        "id": "supported-parent",
+        "claim": "Cold fermentation improves extensibility.",
+        "confidence": 0.9,
+        "status": "reviewed",
+        "style_scope": ["ny_slice"],
+        "variables": ["fermentation_time"],
+        "corroboration": {"verdict": "support", "score": 0.9},
+    }
+    phase, batch = select_batch([supported, draft], set(), 0.65, 5, allow_propagate=True)
+    assert phase == "substantiate" and batch[0]["id"] == "seed-draft"
+    phase, batch = select_batch([supported], set(), 0.65, 5, allow_propagate=True)
+    assert phase == "expand" and batch[0]["id"] == "supported-parent"
+    phase, batch = select_batch([supported], set(), 0.65, 5, allow_propagate=False)
+    assert phase == "seed" and batch == []
+    queries = _search_queries(draft)
+    assert queries[0] == draft["claim"]
+    assert any("bake" in q.lower() for q in queries)
+    report = format_research_report(
+        [
+            {
+                "id": "seed-draft",
+                "claim": draft["claim"],
+                "phase": "substantiate",
+                "verdict": "insufficient",
+                "summary": "thin",
+                "conclusion": "Claim unresolved; sources were inadequate after escalation.",
+                "found": [],
+                "not_found": ["direct bake-temp comparison"],
+                "open_doubts": ["steel pan vs stone bake profile"],
+                "pages_ok": [],
+                "pages_failed": [],
+                "urls_considered": [],
+                "actions": ["recorded unresolved attempt"],
+            }
+        ],
+        session_meta={"actions": 0},
+    )
+    assert "Research loop report" in report
+    assert "Not found" in report
+    assert "direct bake-temp comparison" in report
     print("claims controller self-check ok")
 
 

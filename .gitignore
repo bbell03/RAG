@@ -2,3 +2,7 @@
 __pycache__/
 *.pyc
 .DS_Store
+.venv/
+*.log
+research-report.md
+research-reports/

@@ -1,187 +1,159 @@
-# Autonomous Passive Research Guide
+# Claims controller
 
-This document describes how to configure and run the **Passive Research State** — an autonomous, bounded background loop that scans low-confidence or unverified claims, searches the web for independent scientific and culinary evidence, evaluates truth, and stages substantiated findings for your review.
+`passive-research.py` turns evidence into library edits. It does not replace `query` / `recommend` — those search. This tool **verifies and grows** claims.
 
 ```mermaid
 flowchart TD
-    Scan["1. Scanner:\nWeak claims in cards.jsonl"] --> Retrieve["2. Retrieval + web evidence"]
-    Retrieve --> Critic["3. Truth critic:\nsupport, conflict, or insufficient"]
-    Critic --> Controller["4. Claims controller"]
-    Controller --> Validate["validate:\nkeep the sentence, raise confidence"]
-    Controller --> Modify["modify:\nsame id, corrected sentence"]
-    Controller --> Remove["remove:\narchive.jsonl, never hard-delete"]
-    Controller --> Add["add:\nnew claim the evidence states"]
-    Controller --> Propagate["propagate:\nspecialize into a workflow, or expand the mechanism"]
-    Add --> Stage["candidates.jsonl\ndrafts at confidence <= 0.45"]
-    Propagate --> Stage
-    Validate --> Library["cards.jsonl\nthen rebuild cards.db"]
-    Modify --> Library
-    Remove --> Library
+    Select["Select work"] --> Evidence["Retrieve + critic\n(internal or external)"]
+    Evidence --> Plan["Plan ops"]
+    Plan --> Policy["ClaimLifecyclePolicy gates"]
+    Policy --> Write["Stage / commit / archive"]
+    Write --> Select
 ```
 
----
+## Phases
 
-## 1. Safety Guardrails
-
-Autonomous research in knowledge systems can easily lead to model drift, hallucination compounding, or runaway API usage if unbounded. This pipeline enforces **4 hard safety boundaries**:
-
-| Risk | Architecture Guardrail | Implementation |
+| Phase | What it picks | When |
 | :--- | :--- | :--- |
-| **Hallucination Contamination** | **Draft isolation** | `add` and `propagate` write drafts to `candidates.jsonl` with confidence capped at 0.45. They enter `cards.jsonl` only with `--commit` or an interactive yes. `modify` keeps the same card id and stores the previous sentence on `prior_claim`. |
-| **Runaway API Costs / Loops** | **Bounded Batching & Rate Limiting** | Max claims per run (e.g. 5 claims), max 2 web pages fetched per claim, and explicit 3–5s delays between queries. |
-| **Echo Chambers / Self-Citation** | **Independent Citation Rule** | The critic (`validate.py`) rejects self-referential library claims; it requires external web URLs (`source.reference`) and identifiable mechanisms to assign `support`. |
-| **Vector Space Bloat** | **Semantic Deduplication** | Before storing any refined candidate, Voyage embeddings check cosine similarity against existing cards. Cards with similarity $\ge 0.82$ are flagged as duplicates. |
+| **substantiate** | Draft / low-confidence / unverified cards | Always (default one-shot) |
+| **expand** | Supported reviewed cards with fewer than 3 children | `--until-done` or `--explore` |
+| **seed** | Gap drafts for missing preferred styles/variables | After expand queue is empty, same flags |
 
----
+Default run = substantiate only. Continuous exploration is opt-in.
 
-## 2. Claims controller
+## Operations
 
-[`passive-research.py`](file:///Users/brandonbell/Desktop/RAG/passive-research.py) is the controller. After the critic returns evidence, it proposes one or more of these operations. A planner model (Gemini, or Claude if that is the configured critic) suggests rewrites and learning cards. If that call fails because of quota or an outage and `LOCAL_LLM_URL` plus `LOCAL_LLM_MODEL` are set, the same prompt goes to that local server. If the local call also fails, the controller follows the critic verdict only and does not invent drafts.
+| Op | Meaning |
+| :--- | :--- |
+| **validate** | Sentence stands. Confidence ≥ 0.75, status `reviewed`. |
+| **modify** | Same id, new sentence; old text on `prior_claim`. |
+| **remove** | Move to `archive.jsonl`. Non-interactive runs demote instead. |
+| **add** | New atomic claim from evidence (or manual `--claim`). |
+| **propagate / specialize** | Same mechanism, new style/phase/workflow → child `refines` parent. |
+| **propagate / expand** | Broader style or new variable → child `expands` parent. |
 
-| Operation | When | What changes |
+Workflow targets for specialize: `fermentation_lab_dashboard`, `pizza_cart_app`, `mise_en_place`.
+
+## Internal vs external verification
+
+Verification ≠ the research pipeline (expand/seed). Within verification, evidence mode is explicit.
+
+Step-by-step walkthrough of the search loop for one claim (with a Sicilian bake example): [`CLAIM_VERIFICATION.md`](CLAIM_VERIFICATION.md).
+
+Each verify pass records a full `sources` inventory on the truth/corroboration object (library neighbors + discovered URLs + fetch/cite status). Claims that are **support** with at least one cited http(s) URL get the card tag `sourcewise_supported`.
+
+Quick reference:
+
+| Mode | Flag | What the critic sees |
 | :--- | :--- | :--- |
-| **validate** | Evidence supports the sentence as written | Same id and claim. Confidence rises to at least 0.75. Status becomes `reviewed`. |
-| **modify** | Evidence corrects the scope or the mechanism | Same id. New sentence, `prior_claim`, and `revised_at`. A conflict that is only narrowed stays a draft so a later run can re-check it. |
-| **remove** | The mechanism is contradicted and a narrower true claim is not available | Card moves to [`archive.jsonl`](file:///Users/brandonbell/Desktop/RAG/archive.jsonl). Without `--interactive`, removal is withheld and the card is demoted instead, so the conflict is recorded and the loop can stop. |
-| **add** | Evidence states a different atomic claim | New draft in `candidates.jsonl`. Confidence capped at 0.45. |
-| **propagate / specialize** | The same mechanism should be usable in a specific style, phase, or workflow | Child draft with `refines: [parent id]`. Workflow targets are `fermentation_lab_dashboard`, `pizza_cart_app`, and `mise_en_place`. |
-| **propagate / expand** | Evidence supports a broader style or an adjacent variable | Child draft with `expands: [parent id]`. |
+| **Internal** | `--evidence internal` or `--no-web` | Voyage library neighbors only (claim text, confidence, source refs). **No** web search, **no** HTTP page fetches. |
+| **External** | `--evidence external` (default) | Neighbors + ranked URLs (`research_sources`) + fetched page text. |
 
-Specialize drafts that repeat an existing style + phase + workflow for that parent are dropped. So are near-duplicate sentences (normalized text match, or Voyage cosine similarity ≥ 0.82 against a card other than the parent).
-
-### Commands
+Use **internal** for “does our library already cover or contradict this?”  
+Use **external** for “do independent sources support it?”
 
 ```bash
-# Scan up to 5 weak claims. Confirm nothing. Existing-card edits are written
-# to cards.jsonl. New add/propagate drafts stay in candidates.jsonl.
+# Library-only check (no write)
+python synthesis.py validate --claim "..." --bot local --evidence internal
+
+# Independent web check (no write)
+python synthesis.py validate --claim "..." --bot local --evidence external
+
+# Controller verify-only (no expand/seed)
+python passive-research.py --batch-size 5 --no-propagate --evidence internal
+python passive-research.py modify --id cold-ferment-openability --evidence external
+```
+
+## Commands
+
+```bash
+# One substantiate batch (external evidence by default)
 python passive-research.py --batch-size 5
 
-# Same scan, but confirm every operation:
-python passive-research.py --interactive --batch-size 5
+# Confirm each op
+python passive-research.py -i --batch-size 5
 
-# Keep going until claims are settled or a round finds no corroborated edits.
-python passive-research.py --until-done --max-actions 10
+# Full loop: substantiate → expand → seed
+python3 -u passive-research.py --until-done --commit --max-actions 40 --delay 8
 
-# Research one card, then modify it and fan it out if the evidence supports that.
+# Manual claim (draft ≤ 0.45)
+python passive-research.py add --commit \
+  --claim "..." --style general --variable salt,fermentation_time
+
+# Re-research or rewrite one card
 python passive-research.py modify --id cold-ferment-openability
+python passive-research.py modify --id cold-ferment-openability --claim "Corrected sentence."
 
-# Replace one sentence yourself. The id does not change.
-python passive-research.py modify --id cold-ferment-openability \
-  --claim "Extended cold fermentation relaxes lower-hydration NY dough so it opens with less tearing."
-
-# Add a claim. It is staged at confidence <= 0.45 unless you pass --commit.
-python passive-research.py add \
-  --claim "Protease activity during cold fermentation increases dough extensibility." \
-  --style general --variable fermentation_time,extensibility
-
-# Archive a card.
-python passive-research.py remove --id dough-should-feel-springy-not-wet-before-proofig
-
-# Fan one supported claim into workflow-specific and broader learning drafts.
+# Fan a supported card into workflow drafts
 python passive-research.py propagate --id clock-vs-degree-hours
 
-# Research without spawning those drafts.
+# Soft-delete
+python passive-research.py remove --id higher-flour-protein-requires-more-kneading-before-a
+
+# No children this run
 python passive-research.py --no-propagate
 ```
 
-`--commit` also inserts the new drafts into `cards.jsonl` and rebuilds `cards.db`. `--max-actions` (default 10) caps how many operations a session applies. Each claim is researched at most once per session.
+`--commit` writes new drafts into `cards.jsonl` and rebuilds `cards.db`. Without it, add/propagate land in `candidates.jsonl`.
 
----
+## Safety constraints (enforced in code)
 
-## 3. How "Until-Done" Operates
+From `research_policy.py` / controller constants:
 
-1. **Active targets**: Claims with confidence below 0.65, status `draft`, or corroboration that is missing, `insufficient`, or `skipped`. A claim already marked `support` or `conflict` with status `reviewed` is left alone.
-2. **One pass per claim per session**: Supported claims are validated or rewritten. Contradicted claims are archived only if you confirm; otherwise they are demoted (confidence at most 0.20, status `reviewed`) so the next round does not fetch them again. Insufficient claims are skipped for the rest of the session.
-3. **Re-index when the library changes**: Validated and modified cards are written to [`cards.jsonl`](file:///Users/brandonbell/Desktop/RAG/cards.jsonl) and [`cards.db`](file:///Users/brandonbell/Desktop/RAG/cards.db) is rebuilt, so the next round can use them as neighbors. New drafts stay in `candidates.jsonl` unless `--commit` is set.
-4. **Stop**: The loop stops when nothing is left to research, a round applies no edits, `--max-actions` is hit, or 20 rounds have run. It prints the ids that stayed unsettled.
+| Rule | Value |
+| :--- | :--- |
+| Draft confidence cap | ≤ 0.45 |
+| Create needs support score | ≥ 0.60 |
+| Propagate needs support score | ≥ 0.55 |
+| Archive needs conflict score | ≥ 0.35 |
+| Semantic dedup | cosine ≥ 0.82 |
+| Propagations per parent | ≤ 3 |
+| Adds from one plan | ≤ 2 |
+| Seed rounds per session | ≤ 3 |
+| Default `--max-actions` | 10 |
 
----
+Also:
 
-## 4. Operational Execution Modes
+- Critic bounds the planner (support cannot become remove; conflict cannot become validate).
+- Specialize must change style, phase, or workflow target; expand must broaden style or add a variable.
+- Insufficient evidence is never deletion evidence.
+- Thin external searches retry with style/variable reformulations.
+- If support yields no workflow drafts, a focused propagation planner runs once.
+- Chat uses Gemini/Claude when keyed; otherwise local (`LOCAL_LLM_URL` + `LOCAL_LLM_MODEL`).
 
-### Mode A: Scheduled Periodic Background Job (Cron / Automation)
-Run the script on a schedule (e.g. nightly at 3:00 AM) so fresh research is ready for review every morning:
+## Review after a run
+
+Each controller session writes a basis report under `research-reports/`:
+
+- `research-reports/YYYY-MM-DDTHHMMSS.md` — timestamped snapshot for that run  
+- `research-reports/latest.md` — same content, always the most recent run  
 
 ```bash
-# Add to crontab (crontab -e):
-0 3 * * * cd /Users/brandonbell/Desktop/RAG && /usr/bin/python3 passive-research.py >> research.log 2>&1
-```
-
-*Or within Antigravity:* You can use the `/schedule` slash command to set a recurring timer to invoke passive research batches.
-
----
-
-### Mode B: Deep Autonomous Overnight Exploration
-If you want the assistant to conduct continuous, multi-source literature reviews overnight (e.g., scraping specific food science sites, testing multiple variables, or exploring specific fermentation regimes):
-
-* Use the `/goal` slash command in chat:
-  > `/goal Research all available literature on protease activity in cold-fermented Neapolitan dough. Ingest evidence into candidates.jsonl, substantiate claims with external URLs, and prepare a morning review dossier.`
-
-The agent will run persistently, verifying claims, handling edge cases, and generating a clean summary when finished.
-
----
-
-## 5. Human Review & Promotion Workflow
-
-When a passive research batch completes, you remain in complete control of what enters your golden knowledge base.
-
-### Step 1: Inspect Staged Candidates
-Review the generated findings, citations, and confidence scores:
-```bash
+cat research-reports/latest.md
+ls research-reports/
 cat candidates.jsonl
-```
-
-Example candidate record:
-```json
-{
-  "id": "cold-fermentation-protease-extensibility",
-  "claim": "Extended cold fermentation at 4C allows protease enzymes to relax gluten bonds, increasing extensibility without causing dough slackness.",
-  "variables": ["cold_ferment", "extensibility", "gluten"],
-  "style_scope": ["neapolitan", "general"],
-  "confidence": 0.8,
-  "status": "reviewed",
-  "source": {
-    "type": "article",
-    "reference": "https://www.seriouseats.com/pizza-protips-is-it-ready"
-  },
-  "corroboration": {
-    "verdict": "support",
-    "score": 0.85,
-    "rationale": "Supported by food science analysis confirming enzymatic gluten relaxation under refrigerated retard.",
-    "citations": [
-      {"title": "The Pizza Lab: The Science of Long Cold Fermentation", "url": "https://..."}
-    ],
-    "checked_at": "2026-11-13"
-  }
-}
-```
-
-### Step 2: Commit Approved Cards
-Append the approved cards from `candidates.jsonl` into [`cards.jsonl`](file:///Users/brandonbell/Desktop/RAG/cards.jsonl).
-
-### Step 3: Rebuild Vector Index
-Re-embed the newly substantiated cards into the local SQLite store:
-```bash
 python embed_pipeline.py build --provider voyage
+python embed_pipeline.py query --provider voyage --text "your topic"
 ```
 
-### Step 4: Verify the New Knowledge Base
-Test a query against the newly indexed research:
+## Flags
+
+| Flag | Effect |
+| :--- | :--- |
+| `--batch-size` | Cards per round (default 5) |
+| `--max-actions` | Ops applied per session (default 10) |
+| `--confidence-bar` | Below this → substantiate first (default 0.65) |
+| `--delay` | Seconds between lookups (default 3) |
+| `--until-done` / `--explore` | Run all three phases |
+| `--commit` | Commit new drafts + rebuild index |
+| `--interactive` / `-i` | Confirm each op |
+| `--no-propagate` | Skip specialize/expand |
+| `--evidence internal\|external` | Evidence mode (default external) |
+| `--no-web` | Alias for `--evidence internal` |
+
+Offline checks:
+
 ```bash
-python embed_pipeline.py recommend --provider voyage --reasoner gemini \
-  --text "How does cold fermentation affect dough extensibility?" \
-  --threshold 0.7
+python -m unittest tests.test_research_policy
+python research_policy.py
 ```
-The system will now pass the `0.70` threshold immediately with strong external corroboration and direct citations.
-
----
-
-## 6. Configuration & Tuning
-
-Flags on [`passive-research.py`](file:///Users/brandonbell/Desktop/RAG/passive-research.py):
-
-* **`--batch-size`**: Weak claims researched per round (default `5`). Keep this between 3 and 10 on the free tier.
-* **`--max-actions`**: Applied operations per session (default `10`), counting each validate, modify, add, remove, and propagate.
-* **`--confidence-bar`**: Claims at or above this, already reviewed as support or conflict, are skipped (default `0.65`).
-* **`--delay`**: Seconds between web lookups (default `3`).
-* **`--no-propagate`**: Research and modify claims without spawning workflow drafts.

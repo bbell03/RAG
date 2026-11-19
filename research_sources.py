@@ -1,14 +1,8 @@
-"""Source discovery helpers.
+"""Ranked URL discovery for the truth critic and claims controller.
 
-This module organizes the first three parts of the evidence loop:
-
-1. discover candidate URLs from library hits and operator-provided sources
-2. normalize / dedupe / rank the candidates
-3. return a structured list that other evaluation code can fetch and score
-
-The goal is to keep the interface simple and backward-compatible with the
-existing validate.py contract while making the URL acquisition step explicitly
-separate and testable.
+discover_sources(claim, hits) → [{url, discovered_via, rank, reason}, ...]
+from library hit references, operator extras, then DuckDuckGo search.
+validate.gather_evidence and passive-research research_claim consume this list.
 """
 
 from __future__ import annotations
@@ -111,6 +105,7 @@ def discover_sources(
     use_web: bool = True,
     max_candidates: int = 6,
     search_limit: int = 3,
+    search_queries: Optional[Sequence[str]] = None,
 ) -> List[Dict[str, Any]]:
     """Phase 1-3 of evidence preparation:
 
@@ -155,25 +150,31 @@ def discover_sources(
             )
         )
 
-    # Step 1c: web search fallback when the library and operator sources are thin.
+    # Step 1c: web search across primary claim plus optional reformulations.
+    queries = _dedupe_ordered(
+        [q.strip() for q in (list(search_queries or []) + [claim, f"{claim} pizza dough"]) if q and str(q).strip()]
+    )
     if use_web and len(candidates) < max_candidates:
-        try:
-            for url in _ddg_urls(f"{claim} pizza dough", limit=search_limit):
-                if url in seen_urls:
-                    continue
-                seen_urls.add(url)
-                candidates.append(
-                    _candidate_from_reference(
-                        url,
-                        source="search",
-                        rank=0.60,
-                        reason="ddg search result",
+        for query in queries:
+            if len(candidates) >= max_candidates:
+                break
+            try:
+                for url in _ddg_urls(query, limit=search_limit):
+                    if url in seen_urls:
+                        continue
+                    seen_urls.add(url)
+                    candidates.append(
+                        _candidate_from_reference(
+                            url,
+                            source="search",
+                            rank=0.60,
+                            reason=f"ddg search: {query[:80]}",
+                        )
                     )
-                )
-                if len(candidates) >= max_candidates:
-                    break
-        except (OSError, RuntimeError):
-            pass
+                    if len(candidates) >= max_candidates:
+                        break
+            except (OSError, RuntimeError):
+                continue
 
     # Step 2 + 3: normalize / dedupe / rank. We keep library information first,
     # then extra URLs, then search results, while preserving a stable score.

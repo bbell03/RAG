@@ -1,27 +1,23 @@
 """
 Chat bots — the generative side of this pipeline.
 
-Voyage embeds and ranks. This module is the only place a chat model writes
-or critiques claims:
+Voyage embeds and ranks. This module is where a chat model writes or critiques:
 
-  ingest     source text → candidate cards          (author)
-  validate   claim + evidence → support/conflict    (critic)
-  synthesize question + cards → recommendation      (composer)
-  reason     scores + truth + cards → next action   (planner; not wired yet)
+  ingest            source text → candidate cards
+  validate          claim + evidence → support/conflict
+  synthesize        question + cards → recommendation / gap drafts
+  plan_claim        evidence → validate|modify|remove + adds/propagations
+  plan_propagations supported claim → specialize/expand drafts only
 
-    python synthesis.py ingest --text "..." --bot gemini
-    python synthesis.py validate --claim "..." --bot gemini
+    python synthesis.py ingest --text "..." --bot local
+    python synthesis.py validate --claim "..." --bot local
 
-Claude uses ANTHROPIC_API_KEY. Gemini 3.8 Flash uses GEMINI_API_KEY and is
-on Google's free tier (aistudio.google.com/apikey). Prompts sent on that
-free tier can be used to improve Google's products.
+Bots: gemini (GEMINI_API_KEY), claude (ANTHROPIC_API_KEY), local
+(LOCAL_LLM_URL + LOCAL_LLM_MODEL). Cloud bots fall back to local on quota
+or outage when local is configured. --bot local skips the cloud call.
 
-A local OpenAI-compatible server (Ollama, LM Studio, llama.cpp) can take the
-same prompt when the cloud model is out of quota or unreachable. Set
-LOCAL_LLM_URL and LOCAL_LLM_MODEL. Pass --bot local to skip the cloud call.
-
-Safety: one request at a time, 90s timeout. Error bodies truncated. Ingest
-source is sliced to MAX_DRAFT_CHARS before the prompt.
+Safety: one request at a time; timeouts; truncated error bodies; ingest
+source sliced to MAX_DRAFT_CHARS.
 """
 
 import argparse
@@ -143,10 +139,15 @@ class CardBot:
                 "library card that states the same mechanism with its own citation.\n"
                 "Conflict if a source or library card contradicts the mechanism.\n"
                 "Insufficient if pages failed, are off-topic, or only restate the claim.\n"
+                "Also report coherence of the evidence pack:\n"
+                "- found: concrete facts from the pages that bear on the claim\n"
+                "- not_found: what would be needed to resolve the claim but was missing\n"
+                "- open_doubts: remaining uncertainties after reading the sources\n"
                 "Return JSON only:\n"
                 '{"verdict": "support|conflict|insufficient", "score": 0.0, '
                 '"rationale": "...", "citations": [{"title": "...", "url": "..."}], '
-                '"contradicts": ["card-id"]}\n\n'
+                '"contradicts": ["card-id"], '
+                '"found": ["..."], "not_found": ["..."], "open_doubts": ["..."]}\n\n'
                 f"claim: {claim[:2000]}\n"
                 f"library_neighbors: {json.dumps(evidence.get('library') or [], ensure_ascii=False)}\n"
                 f"source_pages: {json.dumps(evidence.get('pages') or [], ensure_ascii=False)}\n"
@@ -333,6 +334,53 @@ class CardBot:
                 f"library: {json.dumps(neighbors, ensure_ascii=False)[:6000]}\n"
             ),
             system="You edit a dough-research claim library from evidence. Reply with JSON only.",
+        )
+        return _normalize_claim_plan(payload)
+
+    def plan_propagations(self, card: dict, evidence: dict, library: Optional[List[dict]] = None) -> dict:
+        """Focused follow-up: only specialize/expand drafts for a supported claim."""
+        from ingest import schema_enums
+
+        enums = schema_enums()
+        existing = []
+        parent_id = card.get("id")
+        for item in library or []:
+            refs = item.get("refines") or []
+            expands = item.get("expands") or []
+            if parent_id and (parent_id in refs or parent_id in expands):
+                existing.append(
+                    {
+                        "id": item.get("id"),
+                        "claim": (item.get("claim") or "")[:200],
+                        "style_scope": item.get("style_scope"),
+                        "phase": item.get("phase"),
+                        "relevance_targets": item.get("relevance_targets"),
+                        "refines": refs,
+                        "expands": expands,
+                    }
+                )
+        payload = self.complete_json(
+            (
+                "A dough-research claim was already supported. Draft 2-3 NEW learning cards "
+                "that propagate it. Do not restate the parent sentence.\n"
+                "At least one specialize: same mechanism scoped to a different style, phase, "
+                "or workflow target (fermentation_lab_dashboard, pizza_cart_app, mise_en_place).\n"
+                "At least one expand when possible: broader style (often general) or an adjacent variable.\n"
+                "confidence at most 0.45. status draft. One falsifiable sentence each.\n"
+                f"Preferred variables: {enums['variables']}\n"
+                f"Preferred style_scope: {enums['style_scope']}\n"
+                f"Preferred phase: {enums['phase']}\n"
+                f"Preferred relevance_targets: {enums['relevance_targets']}\n"
+                "Return JSON only:\n"
+                '{"action": "validate", "revised_claim": null, "why": "...", "adds": [], '
+                '"propagations": [{"claim": "...", "direction": "specialize|expand", '
+                '"variables": [], "style_scope": [], "phase": [], "kind": null, '
+                '"confidence": 0.4, "relevance_targets": []}]}\n\n'
+                f"parent: {json.dumps({'id': card.get('id'), 'claim': card.get('claim'), 'variables': card.get('variables'), 'style_scope': card.get('style_scope'), 'phase': card.get('phase'), 'relevance_targets': card.get('relevance_targets')}, ensure_ascii=False)}\n"
+                f"existing_children: {json.dumps(existing, ensure_ascii=False)[:3000]}\n"
+                f"evidence: {json.dumps(evidence, ensure_ascii=False)[:3000]}\n"
+            ),
+            system="You expand a supported dough claim into workflow-specific learning cards. JSON only.",
         )
         return _normalize_claim_plan(payload)
 
@@ -645,11 +693,17 @@ def main() -> None:
     """CLI: ingest --text/--url, or validate --claim. Prints JSON to stdout."""
     p = argparse.ArgumentParser(description="Chat bot for ingest and validation.")
     p.add_argument("action", choices=["ingest", "validate"])
-    p.add_argument("--bot", default="gemini", choices=list(BOTS), help="gemini is the free tier. claude needs ANTHROPIC_API_KEY. local uses LOCAL_LLM_URL.")
+    p.add_argument("--bot", default="gemini", choices=list(BOTS), help="gemini | claude | local")
     p.add_argument("--text", default=None, help="Source text for ingest")
     p.add_argument("--url", default=None, help="Source URL for ingest")
     p.add_argument("--claim", default=None, help="Claim to validate")
-    p.add_argument("--no-web", action="store_true")
+    p.add_argument(
+        "--evidence",
+        choices=["internal", "external"],
+        default=None,
+        help="internal = library neighbors only. external = library + web pages (default).",
+    )
+    p.add_argument("--no-web", action="store_true", help="Alias for --evidence internal.")
     args = p.parse_args()
     bot = make_bot(args.bot)
 
@@ -672,7 +726,20 @@ def main() -> None:
         p.error("validate needs --claim")
     from validate import evaluate_truth
 
-    print(json.dumps(evaluate_truth(claim, [], extra_urls=[], use_web=not args.no_web, critic=args.bot), indent=2))
+    evidence = args.evidence or ("internal" if args.no_web else "external")
+    use_web = evidence == "external"
+    hits = []
+    try:
+        from embed_pipeline import query as voyage_query
+
+        hits = voyage_query(claim, top_k=5)
+    except Exception as exc:
+        if evidence == "internal":
+            raise SystemExit(f"internal evidence needs Voyage retrieval: {exc}") from exc
+
+    result = evaluate_truth(claim, hits, extra_urls=[], use_web=use_web, critic=args.bot)
+    result["evidence_mode"] = evidence
+    print(json.dumps(result, indent=2))
 
 
 if __name__ == "__main__":

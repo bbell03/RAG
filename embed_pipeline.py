@@ -2,31 +2,21 @@
 Dough Research Insight Card — Embedding Pipeline
 =================================================
 
-Turns cards.jsonl (schema.json) into a queryable vector index.
+Turns cards.jsonl into a queryable Voyage index in cards.db.
 
-Usage:
-    # .env in this folder (or the same exports in the shell):
-    #   VOYAGE_API_KEY=...
-    #   GEMINI_API_KEY=...
-    export VOYAGE_API_KEY=...
-    export GEMINI_API_KEY=...      # free Gemini drafts / validates; Voyage only embeds
     python embed_pipeline.py build --provider voyage
-    python embed_pipeline.py query --provider voyage --card windowpane-neapolitan-periodic
-    python embed_pipeline.py query --text "how long should Neapolitan dough ferment"
-    python embed_pipeline.py add --claim "For Neapolitan dough, poke-test spring-back beats clock time."
-    python embed_pipeline.py recommend --provider voyage \\
-        --text "is this Neapolitan dough ready to bake" --threshold 0.7 --commit
-    python embed_pipeline.py recommend --provider voyage --reasoner none \\
-        --text "is this Neapolitan dough ready to bake" --threshold 0.7
+    python embed_pipeline.py query --provider voyage --text "Neapolitan over-proofed"
+    python embed_pipeline.py ingest --url "..." --drafter local
+    python embed_pipeline.py add --claim "..."
+    python embed_pipeline.py recommend --provider voyage --reasoner local \\
+        --text "is this dough ready?" --threshold 0.7
 
-Swap in your own embedding provider by adding a function to PROVIDERS below —
-everything else (storage, filtering, ranking) is provider-agnostic.
+Voyage only embeds. Drafting / truth / recommend prose use --drafter /
+--reasoner: local | gemini | claude | none (recommend only).
+Claim verification and library growth: passive-research.py (see README).
 
-Safety (runtime / memory):
-    query() loads every row in cards.db into RAM and scores them — fine for
-    tens/hundreds of cards, not for tens of thousands. Voyage batches at build
-    time; a single query embeds one string. Always close the SQLite connection.
-    Build and query must use the same provider or cosine is meaningless.
+Safety: query() scores the full table in RAM (fine for hundreds of cards).
+Build and query must use the same provider.
 """
 
 import argparse
@@ -620,7 +610,11 @@ def main():
     p.add_argument("--max-rounds", type=int, default=2, help="Retrieve → validate/draft loops before giving up")
     p.add_argument("--prompt", default=None, help="Extra instructions for the reasoner prompt")
     p.add_argument("--no-truth", action="store_true", help="Skip the chat-model truth evaluation (library coverage only)")
-    p.add_argument("--no-web", action="store_true", help="Do not fetch cited URLs or search the web during truth checks")
+    p.add_argument(
+        "--no-web",
+        action="store_true",
+        help="Internal evidence only: library neighbors, no web search or page fetches",
+    )
     args = p.parse_args()
 
     if args.action == "build":
