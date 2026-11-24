@@ -2,6 +2,8 @@
 
 Reference for how **one claim** is checked against **internal** (library) and **external** (web) sources. This is the verification path, not the expand/seed research pipeline.
 
+Product framing (when to verify vs grow, feedback, toggles): [`USE_CASES.md`](USE_CASES.md). Prefer `--profile verify` when you want this loop without minting new claims.
+
 Primary code: `passive-research.research_claim` → `research_sources.discover_sources` → `validate.gather_evidence` → `validate.evaluate_truth` → chat critic.
 
 Standalone entry (no library write):

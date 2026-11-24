@@ -49,6 +49,7 @@ from ingest import (
     _mentions,
 )
 from recommend import REASONERS, assess_drafts, recommend as run_recommend
+from research_features import add_feature_arguments, features_from_args
 
 CARDS_PATH = "cards.jsonl"
 DB_PATH = "cards.db"
@@ -528,6 +529,7 @@ def _run_recommend(args, parser) -> None:
         )
 
     try:
+        feats = features_from_args(args)
         result = run_recommend(
             text,
             retrieve_fn=retrieve,
@@ -543,6 +545,7 @@ def _run_recommend(args, parser) -> None:
             out_path=args.out,
             check_truth=not args.no_truth,
             use_web=not args.no_web,
+            allow_gap_draft=feats.recommend_gap_draft,
         )
     except (ValueError, RuntimeError, KeyError) as exc:
         parser.error(str(exc))
@@ -615,6 +618,7 @@ def main():
         action="store_true",
         help="Internal evidence only: library neighbors, no web search or page fetches",
     )
+    add_feature_arguments(p, include_recommend=True)
     args = p.parse_args()
 
     if args.action == "build":

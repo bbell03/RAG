@@ -298,11 +298,13 @@ def recommend(
     check_truth: bool = True,
     use_web: bool = True,
     critic: Optional[str] = None,
+    allow_gap_draft: bool = True,
 ) -> dict:
     """Retrieve → score → optional chat compose/truth → maybe draft, up to max_rounds.
 
     Returns a report dict (ready, recommendation, hits, drafted, rounds).
-    Writes candidates only if any cards were drafted. Does not rebuild cards.db.
+    Writes candidates only if gap drafting is enabled and cards were drafted.
+    Does not rebuild cards.db. Set allow_gap_draft=False for ask-only mode.
     """
     if reasoner not in REASONERS:
         raise ValueError(f"unknown reasoner {reasoner!r}. reasoners: {sorted(REASONERS)}")
@@ -327,13 +329,15 @@ def recommend(
         library = combined_score(retrieval, verdict.get("coverage"))
         truth = evaluate_truth(question, hits, use_web=use_web, critic=critic) if check_truth else {"verdict": "skipped"}
         score, truth_ok = apply_truth(library, truth)
-        new_cards = cards_from_reasoner(verdict.get("cards") or [], question)
-        # Don't re-add claims we already drafted this run.
-        have = {c["claim"] for c in drafted}
-        fresh = [c for c in new_cards if c["claim"] not in have]
-        if check_truth and fresh:
-            assess_drafts(fresh, lambda claim: hits, check_truth=True, use_web=use_web, critic=critic)
-        drafted.extend(fresh)
+        fresh: List[dict] = []
+        if allow_gap_draft:
+            new_cards = cards_from_reasoner(verdict.get("cards") or [], question)
+            # Don't re-add claims we already drafted this run.
+            have = {c["claim"] for c in drafted}
+            fresh = [c for c in new_cards if c["claim"] not in have]
+            if check_truth and fresh:
+                assess_drafts(fresh, lambda claim: hits, check_truth=True, use_web=use_web, critic=critic)
+            drafted.extend(fresh)
         ready = bool(verdict.get("ready") and score >= threshold and truth_ok is not False)
         report.append(
             {
@@ -346,11 +350,14 @@ def recommend(
                 "ready": ready,
                 "drafted": [c["id"] for c in fresh],
                 "gaps": verdict.get("gaps") or [],
+                "gap_draft": allow_gap_draft,
             }
         )
         if ready:
             break
-        if not fresh:
+        if allow_gap_draft and not fresh:
+            break
+        if not allow_gap_draft:
             break
 
     if drafted:
@@ -372,4 +379,5 @@ def recommend(
         "rounds": report,
         "committed": bool(commit and drafted),
         "candidates_path": out_path if drafted else None,
+        "gap_draft": allow_gap_draft,
     }

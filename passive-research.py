@@ -32,6 +32,7 @@ from ingest import (
     normalize_card,
     schema_enums,
 )
+from research_features import ResearchFeatures, add_feature_arguments, features_from_args
 from research_policy import ClaimLifecyclePolicy
 from synthesis import load_env
 from validate import apply_sourcewise_tag, evaluate_truth, is_url
@@ -162,27 +163,31 @@ def select_batch(
     confidence_bar: float,
     batch_size: int,
     allow_propagate: bool,
+    features: Optional[ResearchFeatures] = None,
 ) -> Tuple[str, List[dict]]:
     """Pick the next work phase and a batch of cards.
 
-    substantiate → expand → seed. Seed returns an empty card list; the session
-    drafts gap claims instead of researching an existing id.
+    substantiate → expand → seed|done. Seed returns an empty card list; the
+    session drafts gap claims instead of researching an existing id. When seed
+    and expand are disabled, returns phase "done".
     """
-    weak = [
-        card
-        for card in library
-        if card.get("id") not in unresolved and is_needing_substantiation(card, confidence_bar)
-    ]
-    if weak:
-        weak.sort(
-            key=lambda card: (
-                0 if card.get("status") == "draft" else 1,
-                float(card.get("confidence") or 0.0),
+    feats = features or ResearchFeatures()
+    if feats.substantiate:
+        weak = [
+            card
+            for card in library
+            if card.get("id") not in unresolved and is_needing_substantiation(card, confidence_bar)
+        ]
+        if weak:
+            weak.sort(
+                key=lambda card: (
+                    0 if card.get("status") == "draft" else 1,
+                    float(card.get("confidence") or 0.0),
+                )
             )
-        )
-        return "substantiate", weak[:batch_size]
+            return "substantiate", weak[:batch_size]
 
-    if allow_propagate:
+    if feats.expand and allow_propagate:
         ripe = [
             card
             for card in library
@@ -192,7 +197,9 @@ def select_batch(
             ripe.sort(key=lambda card: -float(card.get("confidence") or 0.0))
             return "expand", ripe[:batch_size]
 
-    return "seed", []
+    if feats.seed:
+        return "seed", []
+    return "done", []
 
 
 def load_library_cards(path: str = CARDS_PATH) -> List[dict]:
@@ -495,12 +502,15 @@ def ops_from_plan(
     allow_propagate: bool = True,
     propagate_unproven: bool = False,
     duplicate_fn: Optional[Callable[[str], bool]] = None,
+    features: Optional[ResearchFeatures] = None,
 ) -> List[ClaimOp]:
     """Turn a planner payload into concrete add / modify / remove / propagate ops.
 
     ClaimLifecyclePolicy gates create/modify/propagate/archive. Structural
-    verification runs before an op is returned.
+    verification runs before an op is returned. ResearchFeatures modulates
+    evidence_adds and propagate independently of parent validate/modify/remove.
     """
+    feats = features or ResearchFeatures()
     verdict = (truth or {}).get("verdict")
     if verdict not in ("support", "conflict"):
         return []
@@ -562,6 +572,11 @@ def ops_from_plan(
     if action == "remove" and any(op.op == "remove" for op in ops):
         return ops
 
+    growth_ok = feats.allow_growth(truth) or propagate_unproven
+    if not growth_ok:
+        _log("  Growth skipped: require_sourcewise_for_growth and claim is not sourcewise_supported.")
+        return ops
+
     reference = _evidence_reference(truth or {}, card)
     known = _known_claims(library)
     known.add(_norm_claim(card.get("claim") or ""))
@@ -575,7 +590,7 @@ def ops_from_plan(
             return False
         return True
 
-    if verdict == "support":
+    if verdict == "support" and feats.evidence_adds:
         for raw in (plan.get("adds") or [])[:ADD_LIMIT]:
             if not _accept_text(raw.get("claim") or ""):
                 continue
@@ -590,7 +605,7 @@ def ops_from_plan(
                 ops.append(kept)
                 known.add(_norm_claim(draft.get("claim") or ""))
 
-    if allow_propagate:
+    if allow_propagate and feats.propagate:
         emitted = 0
         for raw in plan.get("propagations") or []:
             if emitted >= PROPAGATION_LIMIT:
@@ -898,8 +913,16 @@ def format_research_report(notes: List[dict], session_meta: Optional[dict] = Non
         f"- Generated: {date.today().isoformat()}",
         f"- Actions applied: {meta.get('actions', 0)}",
         f"- Claims examined: {len(notes)}",
-        "",
     ]
+    if meta.get("evidence_mode"):
+        lines.append(f"- Evidence mode: {meta.get('evidence_mode')}")
+    feats = meta.get("features") or {}
+    if feats:
+        on = [k for k, v in feats.items() if v]
+        off = [k for k, v in feats.items() if not v]
+        lines.append(f"- Features on: {', '.join(on) or '(none)'}")
+        lines.append(f"- Features off: {', '.join(off) or '(none)'}")
+    lines.append("")
     if not notes:
         lines.append("No claims were researched in this session.")
         lines.append("")
@@ -1040,10 +1063,15 @@ class ClaimsController:
         library: List[dict],
         allow_propagate: bool = True,
         planner=None,
+        features: Optional[ResearchFeatures] = None,
     ):
         self.library = list(library)
         self.by_id = {card["id"]: card for card in library if card.get("id")}
-        self.allow_propagate = allow_propagate
+        self.features = features or ResearchFeatures(propagate=allow_propagate)
+        if not allow_propagate:
+            self.features.propagate = False
+            self.features.focused_propagate = False
+        self.allow_propagate = self.features.propagate
         self.planner = planner
         self.taken = [card["id"] for card in library if card.get("id")]
 
@@ -1059,7 +1087,7 @@ class ClaimsController:
         """Plan library edits for one card. Does not write.
 
         If support yields no propagate ops, request a focused propagation plan
-        once so validated claims still fan into workflows.
+        once so validated claims still fan into workflows (when enabled).
         """
         verdict = (truth or {}).get("verdict")
         if verdict not in ("support", "conflict") and not propagate_unproven:
@@ -1086,6 +1114,7 @@ class ClaimsController:
             allow_propagate=self.allow_propagate,
             propagate_unproven=propagate_unproven,
             duplicate_fn=duplicate_fn,
+            features=self.features,
         )
         has_propagate = any(op.op == "propagate" for op in ops)
         ripe = is_ripe_for_expansion(
@@ -1099,6 +1128,7 @@ class ClaimsController:
         )
         needs_propagate = (
             self.allow_propagate
+            and self.features.focused_propagate
             and working_truth.get("verdict") == "support"
             and not has_propagate
             and (force_propagate or ripe)
@@ -1121,6 +1151,7 @@ class ClaimsController:
                 allow_propagate=True,
                 propagate_unproven=False,
                 duplicate_fn=duplicate_fn,
+                features=self.features,
             )
             ops.extend(op for op in more if op.op == "propagate")
         if propagate_unproven or skip_parent_edit:
@@ -1423,6 +1454,7 @@ def research_session(
     only_id: Optional[str] = None,
     explore: bool = False,
     use_web: bool = True,
+    features: Optional[ResearchFeatures] = None,
 ) -> None:
     """Run substantiate → expand → seed until bounds are hit.
 
@@ -1432,12 +1464,18 @@ def research_session(
 
     use_web=True is external evidence (library + web). use_web=False is
     internal evidence (library neighbors only, no HTTP).
+
+    ResearchFeatures modulates expand/seed/propagate/evidence_adds independently.
     """
     try:
         sys.stdout.reconfigure(line_buffering=True)
     except Exception:
         pass
 
+    feats = features or ResearchFeatures(propagate=allow_propagate)
+    if not allow_propagate:
+        feats.propagate = False
+        feats.focused_propagate = False
     actions = 0
     unresolved: Set[str] = set()
     expanded_ids: Set[str] = set()
@@ -1452,15 +1490,15 @@ def research_session(
     _log("  CLAIMS CONTROLLER")
     _log(
         f"  Confidence {confidence_bar} | batch {batch_size} | "
-        f"max actions {max_actions} | propagate {allow_propagate} | "
-        f"explore {continuous} | evidence {evidence_mode}"
+        f"max actions {max_actions} | explore {continuous} | evidence {evidence_mode}"
     )
+    _log(f"  Features: {feats.summary()}")
     _log("=" * 60)
 
     while True:
         round_n += 1
         library = load_library_cards()
-        controller = ClaimsController(library, allow_propagate=allow_propagate)
+        controller = ClaimsController(library, allow_propagate=feats.propagate, features=feats)
         progressed = False
         researched_this_round = False
         quit_session = False
@@ -1477,13 +1515,21 @@ def research_session(
                 unresolved | expanded_ids | exhausted_ids,
                 confidence_bar,
                 batch_size,
-                allow_propagate=allow_propagate and continuous,
+                allow_propagate=feats.propagate and feats.expand and continuous,
+                features=feats,
             )
+
+        if phase == "done":
+            _log("\nNo claims left below the confidence bar (expand/seed disabled or empty).")
+            break
 
         if phase == "seed":
             if not continuous:
                 _log("\nNo claims left below the confidence bar.")
                 _log("Pass --until-done or --explore to expand supported claims and seed gaps.")
+                break
+            if not feats.seed:
+                _log("\nSeed phase disabled (--no-seed or profile). Stopping.")
                 break
             if seed_rounds >= 3:
                 _log("\nSeed round cap reached.")
@@ -1640,11 +1686,19 @@ def research_session(
             _log("\nRound cap reached.")
             break
 
-    report_path = write_research_report(notes, session_meta={"actions": actions})
+    report_path = write_research_report(
+        notes,
+        session_meta={"actions": actions, "features": feats.to_dict(), "evidence_mode": evidence_mode},
+    )
     _log("\n" + "=" * 60)
     _log("  RESEARCH REPORT")
     _log("=" * 60)
-    _log(format_research_report(notes, session_meta={"actions": actions}))
+    _log(
+        format_research_report(
+            notes,
+            session_meta={"actions": actions, "features": feats.to_dict(), "evidence_mode": evidence_mode},
+        )
+    )
     _log(f"Wrote basis report → {report_path}")
 
     if unresolved:
@@ -1813,7 +1867,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--confidence-bar", type=float, default=0.65, help="Claims below this are researched first.")
     parser.add_argument("--delay", type=float, default=3.0, help="Seconds between web lookups.")
     parser.add_argument("--commit", action="store_true", help="Write new drafts into cards.jsonl and rebuild the index.")
-    parser.add_argument("--no-propagate", action="store_true", help="Do not fan claims out into workflow drafts.")
+    add_feature_arguments(parser, include_recommend=False)
     parser.add_argument(
         "--evidence",
         choices=["internal", "external"],
@@ -1856,6 +1910,7 @@ def main() -> None:
             raise SystemExit("propagate requires --id")
         command_propagate(args)
         return
+    feats = features_from_args(args)
     research_session(
         interactive=args.interactive,
         auto_commit=args.commit,
@@ -1864,10 +1919,11 @@ def main() -> None:
         batch_size=args.batch_size,
         delay=args.delay,
         until_done=args.until_done,
-        allow_propagate=not args.no_propagate,
+        allow_propagate=feats.propagate,
         only_id=args.id,
         explore=args.explore,
         use_web=_use_web_from_args(args),
+        features=feats,
     )
 
 
@@ -2042,6 +2098,21 @@ def _self_check() -> None:
     assert phase == "expand" and batch[0]["id"] == "supported-parent"
     phase, batch = select_batch([supported], set(), 0.65, 5, allow_propagate=False)
     assert phase == "seed" and batch == []
+    phase, batch = select_batch(
+        [supported],
+        set(),
+        0.65,
+        5,
+        allow_propagate=False,
+        features=ResearchFeatures(expand=False, seed=False),
+    )
+    assert phase == "done" and batch == []
+    verify_feats = ResearchFeatures(
+        expand=False, seed=False, propagate=False, evidence_adds=False, focused_propagate=False
+    )
+    quiet_ops = ops_from_plan(parent, truth, plan, library, list(taken), features=verify_feats)
+    assert all(op.op in ("validate", "modify", "remove") for op in quiet_ops)
+    assert not any(op.op in ("add", "propagate") for op in quiet_ops)
     queries = _search_queries(draft)
     assert queries[0] == draft["claim"]
     assert any("bake" in q.lower() for q in queries)
